@@ -512,7 +512,7 @@ renderCaddyfile() {
   cat <<EOF
 {
   debug
-	servers :80,:443 {
+	servers :8088,:8443 {
     protocols h1 h2c
   }
 }
@@ -557,13 +557,13 @@ renderCaddyfile() {
     }
 }
 
-:80${CADDY_SECURE_DOMAIN} {
+:8088${CADDY_SECURE_DOMAIN} {
     import security_headers
     # Signal
-    reverse_proxy /signalexchange.SignalExchange/* h2c://signal:10000
+    reverse_proxy /signalexchange.SignalExchange/* h2c://signal:10001
     # Management
-    reverse_proxy /api/* management:80
-    reverse_proxy /management.ManagementService/* h2c://management:80
+    reverse_proxy /api/* management:8088
+    reverse_proxy /management.ManagementService/* h2c://management:8088
     # Zitadel
     reverse_proxy /zitadel.admin.v1.AdminService/* h2c://zitadel:8080
     reverse_proxy /admin/v1/* h2c://zitadel:8080
@@ -584,7 +584,7 @@ renderCaddyfile() {
     reverse_proxy /device/* h2c://zitadel:8080
     reverse_proxy /device h2c://zitadel:8080
     # Dashboard
-    reverse_proxy /* dashboard:80
+    reverse_proxy /* dashboard:8088
 }
 EOF
 }
@@ -754,8 +754,8 @@ services:
     restart: unless-stopped
     networks: [ netbird ]
     ports:
-      - '443:443'
-      - '80:80'
+      - '8443:8443'
+      - '8088:8088'
       - '8080:8080'
     volumes:
       - netbird_caddy_data:/data
