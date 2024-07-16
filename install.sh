@@ -422,7 +422,7 @@ initEnvironment() {
   ZITADEL_EXTERNALSECURE="false"
   ZITADEL_TLS_MODE="disabled"
   ZITADEL_MASTERKEY="$(openssl rand -base64 32 | head -c 32)"
-  NETBIRD_PORT=80
+  NETBIRD_PORT=8088
   NETBIRD_HTTP_PROTOCOL="http"
   TURN_USER="self"
   TURN_PASSWORD=$(openssl rand -base64 32 | sed 's/=//g')
@@ -439,7 +439,7 @@ initEnvironment() {
   else
     ZITADEL_EXTERNALSECURE="true"
     ZITADEL_TLS_MODE="external"
-    NETBIRD_PORT=443
+    NETBIRD_PORT=8443
     CADDY_SECURE_DOMAIN=", $NETBIRD_DOMAIN:$NETBIRD_PORT"
     NETBIRD_HTTP_PROTOCOL="https"
   fi
@@ -591,9 +591,9 @@ EOF
 
 renderTurnServerConf() {
   cat <<EOF
-listening-port=3478
+listening-port=3479
 $TURN_EXTERNAL_IP_CONFIG
-tls-listening-port=5349
+tls-listening-port=5347
 min-port=$TURN_MIN_PORT
 max-port=$TURN_MAX_PORT
 fingerprint
@@ -615,14 +615,14 @@ renderManagementJson() {
     "Stuns": [
         {
             "Proto": "udp",
-            "URI": "stun:$NETBIRD_DOMAIN:3478"
+            "URI": "stun:$NETBIRD_DOMAIN:3479"
         }
     ],
     "TURNConfig": {
         "Turns": [
             {
                 "Proto": "udp",
-                "URI": "turn:$NETBIRD_DOMAIN:3478",
+                "URI": "turn:$NETBIRD_DOMAIN:3479",
                 "Username": "$TURN_USER",
                 "Password": "$TURN_PASSWORD"
             }
@@ -791,7 +791,7 @@ services:
       - netbird_management:/var/lib/netbird
       - ./management.json:/etc/netbird/management.json
     command: [
-      "--port", "80",
+      "--port", "8088",
       "--log-file", "console",
       "--log-level", "info",
       "--disable-anonymous-metrics=false",
