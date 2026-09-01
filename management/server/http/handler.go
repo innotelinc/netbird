@@ -4,223 +4,144 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/netip"
 
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
+	log "github.com/sirupsen/logrus"
 
-	"github.com/netbirdio/management-integrations/integrations"
+	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/domain/manager"
 
-	s "github.com/netbirdio/netbird/management/server"
+	"github.com/netbirdio/netbird/management/server/types"
+
+	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/accesslogs"
+	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/proxytoken"
+	"github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service"
+	reverseproxymanager "github.com/netbirdio/netbird/management/internals/modules/reverseproxy/service/manager"
+
+	nbgrpc "github.com/netbirdio/netbird/management/internals/shared/grpc"
+	idpmanager "github.com/netbirdio/netbird/management/server/idp"
+
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map"
+	"github.com/netbirdio/netbird/management/internals/modules/agentnetwork"
+	agentnetworkhandlers "github.com/netbirdio/netbird/management/internals/modules/agentnetwork/handlers"
+	"github.com/netbirdio/netbird/management/internals/modules/zones"
+	zonesManager "github.com/netbirdio/netbird/management/internals/modules/zones/manager"
+	"github.com/netbirdio/netbird/management/internals/modules/zones/records"
+	recordsManager "github.com/netbirdio/netbird/management/internals/modules/zones/records/manager"
+	"github.com/netbirdio/netbird/management/server/account"
+	"github.com/netbirdio/netbird/management/server/settings"
+
+	"github.com/netbirdio/netbird/management/server/permissions"
+
+	"github.com/netbirdio/netbird/management/server/http/handlers/proxy"
+
+	"github.com/netbirdio/netbird/management/server/auth"
 	"github.com/netbirdio/netbird/management/server/geolocation"
+	nbgroups "github.com/netbirdio/netbird/management/server/groups"
+	"github.com/netbirdio/netbird/management/server/http/handlers/accounts"
+	"github.com/netbirdio/netbird/management/server/http/handlers/dns"
+	"github.com/netbirdio/netbird/management/server/http/handlers/events"
+	"github.com/netbirdio/netbird/management/server/http/handlers/groups"
+	"github.com/netbirdio/netbird/management/server/http/handlers/idp"
+	"github.com/netbirdio/netbird/management/server/http/handlers/instance"
+	"github.com/netbirdio/netbird/management/server/http/handlers/networks"
+	"github.com/netbirdio/netbird/management/server/http/handlers/peers"
+	"github.com/netbirdio/netbird/management/server/http/handlers/policies"
+	"github.com/netbirdio/netbird/management/server/http/handlers/routes"
+	"github.com/netbirdio/netbird/management/server/http/handlers/setup_keys"
+	"github.com/netbirdio/netbird/management/server/http/handlers/users"
 	"github.com/netbirdio/netbird/management/server/http/middleware"
-	"github.com/netbirdio/netbird/management/server/integrated_validator"
-	"github.com/netbirdio/netbird/management/server/jwtclaims"
+	"github.com/netbirdio/netbird/management/server/http/middleware/bypass"
+	nbinstance "github.com/netbirdio/netbird/management/server/instance"
+	nbnetworks "github.com/netbirdio/netbird/management/server/networks"
+	"github.com/netbirdio/netbird/management/server/networks/resources"
+	"github.com/netbirdio/netbird/management/server/networks/routers"
 	"github.com/netbirdio/netbird/management/server/telemetry"
 )
 
-const apiPrefix = "/api"
+// NewAPIHandler creates the Management service HTTP API handler registering all the available endpoints.
+func NewAPIHandler(ctx context.Context, router *mux.Router, accountManager account.Manager, networksManager nbnetworks.Manager, resourceManager resources.Manager, routerManager routers.Manager, groupsManager nbgroups.Manager, LocationManager geolocation.Geolocation, authManager auth.Manager, appMetrics telemetry.AppMetrics, permissionsManager permissions.Manager, settingsManager settings.Manager, zManager zones.Manager, rManager records.Manager, networkMapController network_map.Controller, idpManager idpmanager.Manager, serviceManager service.Manager, reverseProxyDomainManager *manager.Manager, reverseProxyAccessLogsManager accesslogs.Manager, proxyGRPCServer *nbgrpc.ProxyServiceServer, trustedHTTPProxies []netip.Prefix, rateLimiter *middleware.APIRateLimiter, isValidChildAccount middleware.IsValidChildAccountFunc, agentNetworkManager agentnetwork.Manager) (http.Handler, error) {
 
-// AuthCfg contains parameters for authentication middleware
-type AuthCfg struct {
-	Issuer       string
-	Audience     string
-	UserIDClaim  string
-	KeysLocation string
-}
+	// Register bypass paths for unauthenticated endpoints
+	if err := bypass.AddBypassPath("/api/instance"); err != nil {
+		return nil, fmt.Errorf("failed to add bypass path: %w", err)
+	}
+	if err := bypass.AddBypassPath("/api/setup"); err != nil {
+		return nil, fmt.Errorf("failed to add bypass path: %w", err)
+	}
+	// Public invite endpoints (tokens start with nbi_)
+	if err := bypass.AddBypassPath("/api/users/invites/nbi_*"); err != nil {
+		return nil, fmt.Errorf("failed to add bypass path: %w", err)
+	}
+	if err := bypass.AddBypassPath("/api/users/invites/nbi_*/accept"); err != nil {
+		return nil, fmt.Errorf("failed to add bypass path: %w", err)
+	}
+	// OAuth callback for proxy authentication
+	if err := bypass.AddBypassPath(types.ProxyCallbackEndpointFull); err != nil {
+		return nil, fmt.Errorf("failed to add bypass path: %w", err)
+	}
 
-type apiHandler struct {
-	Router             *mux.Router
-	AccountManager     s.AccountManager
-	geolocationManager *geolocation.Geolocation
-	AuthCfg            AuthCfg
-}
-
-// EmptyObject is an empty struct used to return empty JSON object
-type emptyObject struct {
-}
-
-// APIHandler creates the Management service HTTP API handler registering all the available endpoints.
-func APIHandler(ctx context.Context, accountManager s.AccountManager, LocationManager *geolocation.Geolocation, jwtValidator jwtclaims.JWTValidator, appMetrics telemetry.AppMetrics, authCfg AuthCfg, integratedValidator integrated_validator.IntegratedValidator) (http.Handler, error) {
-	claimsExtractor := jwtclaims.NewClaimsExtractor(
-		jwtclaims.WithAudience(authCfg.Audience),
-		jwtclaims.WithUserIDClaim(authCfg.UserIDClaim),
-	)
+	if rateLimiter == nil {
+		log.Warn("NewAPIHandler: nil rate limiter, rate limiting disabled")
+		rateLimiter = middleware.NewAPIRateLimiter(nil)
+		rateLimiter.SetEnabled(false)
+	}
 
 	authMiddleware := middleware.NewAuthMiddleware(
-		accountManager.GetAccountFromPAT,
-		jwtValidator.ValidateAndParse,
-		accountManager.MarkPATUsed,
-		accountManager.CheckUserAccessByJWTGroups,
-		claimsExtractor,
-		authCfg.Audience,
-		authCfg.UserIDClaim,
+		authManager,
+		accountManager.GetAccountIDFromUserAuth,
+		accountManager.SyncUserJWTGroups,
+		accountManager.GetUserFromUserAuth,
+		rateLimiter,
+		appMetrics.GetMeter(),
+		isValidChildAccount,
 	)
 
 	corsMiddleware := cors.AllowAll()
 
-	claimsExtractor = jwtclaims.NewClaimsExtractor(
-		jwtclaims.WithAudience(authCfg.Audience),
-		jwtclaims.WithUserIDClaim(authCfg.UserIDClaim),
-	)
-
-	acMiddleware := middleware.NewAccessControl(
-		authCfg.Audience,
-		authCfg.UserIDClaim,
-		accountManager.GetUser)
-
-	rootRouter := mux.NewRouter()
 	metricsMiddleware := appMetrics.HTTPMiddleware()
 
-	prefix := apiPrefix
-	router := rootRouter.PathPrefix(prefix).Subrouter()
-	router.Use(metricsMiddleware.Handler, corsMiddleware.Handler, authMiddleware.Handler, acMiddleware.Handler)
+	router.Use(metricsMiddleware.Handler, corsMiddleware.Handler, authMiddleware.Handler)
 
-	api := apiHandler{
-		Router:             router,
-		AccountManager:     accountManager,
-		geolocationManager: LocationManager,
-		AuthCfg:            authCfg,
-	}
-
-	if _, err := integrations.RegisterHandlers(ctx, prefix, api.Router, accountManager, claimsExtractor, integratedValidator); err != nil {
-		return nil, fmt.Errorf("register integrations endpoints: %w", err)
-	}
-
-	api.addAccountsEndpoint()
-	api.addPeersEndpoint()
-	api.addUsersEndpoint()
-	api.addUsersTokensEndpoint()
-	api.addSetupKeysEndpoint()
-	api.addPoliciesEndpoint()
-	api.addGroupsEndpoint()
-	api.addRoutesEndpoint()
-	api.addDNSNameserversEndpoint()
-	api.addDNSSettingEndpoint()
-	api.addEventsEndpoint()
-	api.addPostureCheckEndpoint()
-	api.addLocationsEndpoint()
-
-	err := api.Router.Walk(func(route *mux.Route, _ *mux.Router, _ []*mux.Route) error {
-		methods, err := route.GetMethods()
-		if err != nil { // we may have wildcard routes from integrations without methods, skip them for now
-			methods = []string{}
-		}
-		for _, method := range methods {
-			template, err := route.GetPathTemplate()
-			if err != nil {
-				return err
-			}
-			err = metricsMiddleware.AddHTTPRequestResponseCounter(template, method)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	instanceManager, err := nbinstance.NewManager(ctx, accountManager.GetStore(), idpManager)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create instance manager: %w", err)
 	}
 
-	return rootRouter, nil
-}
+	accounts.AddEndpoints(accountManager, settingsManager, router)
+	peers.AddEndpoints(accountManager, router, networkMapController, permissionsManager)
+	users.AddEndpoints(accountManager, router)
+	users.AddInvitesEndpoints(accountManager, router)
+	users.AddPublicInvitesEndpoints(accountManager, router)
+	setup_keys.AddEndpoints(accountManager, router)
+	policies.AddEndpoints(accountManager, LocationManager, router)
+	policies.AddPostureCheckEndpoints(accountManager, LocationManager, router)
+	policies.AddLocationsEndpoints(accountManager, LocationManager, permissionsManager, router)
+	groups.AddEndpoints(accountManager, router)
+	routes.AddEndpoints(accountManager, router)
+	dns.AddEndpoints(accountManager, router)
+	events.AddEndpoints(accountManager, router)
+	networks.AddEndpoints(networksManager, resourceManager, routerManager, groupsManager, accountManager, router)
+	zonesManager.RegisterEndpoints(router, zManager)
+	recordsManager.RegisterEndpoints(router, rManager)
+	idp.AddEndpoints(accountManager, router)
+	if agentNetworkManager != nil {
+		agentnetworkhandlers.RegisterEndpoints(agentNetworkManager, router)
+	}
+	instance.AddEndpoints(instanceManager, accountManager, router)
+	instance.AddVersionEndpoint(instanceManager, router)
+	if serviceManager != nil && reverseProxyDomainManager != nil {
+		reverseproxymanager.RegisterEndpoints(serviceManager, *reverseProxyDomainManager, reverseProxyAccessLogsManager, permissionsManager, router)
+	}
 
-func (apiHandler *apiHandler) addAccountsEndpoint() {
-	accountsHandler := NewAccountsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/accounts/{accountId}", accountsHandler.UpdateAccount).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/accounts/{accountId}", accountsHandler.DeleteAccount).Methods("DELETE", "OPTIONS")
-	apiHandler.Router.HandleFunc("/accounts", accountsHandler.GetAllAccounts).Methods("GET", "OPTIONS")
-}
+	proxytoken.RegisterEndpoints(accountManager.GetStore(), permissionsManager, router)
 
-func (apiHandler *apiHandler) addPeersEndpoint() {
-	peersHandler := NewPeersHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/peers", peersHandler.GetAllPeers).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/peers/{peerId}", peersHandler.HandlePeer).
-		Methods("GET", "PUT", "DELETE", "OPTIONS")
-}
+	// Register OAuth callback handler for proxy authentication
+	if proxyGRPCServer != nil {
+		oauthHandler := proxy.NewAuthCallbackHandler(proxyGRPCServer, trustedHTTPProxies)
+		oauthHandler.RegisterEndpoints(router)
+	}
 
-func (apiHandler *apiHandler) addUsersEndpoint() {
-	userHandler := NewUsersHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/users", userHandler.GetAllUsers).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}", userHandler.UpdateUser).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}", userHandler.DeleteUser).Methods("DELETE", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users", userHandler.CreateUser).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}/invite", userHandler.InviteUser).Methods("POST", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addUsersTokensEndpoint() {
-	tokenHandler := NewPATsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/users/{userId}/tokens", tokenHandler.GetAllTokens).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}/tokens", tokenHandler.CreateToken).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}/tokens/{tokenId}", tokenHandler.GetToken).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/users/{userId}/tokens/{tokenId}", tokenHandler.DeleteToken).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addSetupKeysEndpoint() {
-	keysHandler := NewSetupKeysHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/setup-keys", keysHandler.GetAllSetupKeys).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/setup-keys", keysHandler.CreateSetupKey).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/setup-keys/{keyId}", keysHandler.GetSetupKey).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/setup-keys/{keyId}", keysHandler.UpdateSetupKey).Methods("PUT", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addPoliciesEndpoint() {
-	policiesHandler := NewPoliciesHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/policies", policiesHandler.GetAllPolicies).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/policies", policiesHandler.CreatePolicy).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/policies/{policyId}", policiesHandler.UpdatePolicy).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/policies/{policyId}", policiesHandler.GetPolicy).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/policies/{policyId}", policiesHandler.DeletePolicy).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addGroupsEndpoint() {
-	groupsHandler := NewGroupsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/groups", groupsHandler.GetAllGroups).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/groups", groupsHandler.CreateGroup).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/groups/{groupId}", groupsHandler.UpdateGroup).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/groups/{groupId}", groupsHandler.GetGroup).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/groups/{groupId}", groupsHandler.DeleteGroup).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addRoutesEndpoint() {
-	routesHandler := NewRoutesHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/routes", routesHandler.GetAllRoutes).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/routes", routesHandler.CreateRoute).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/routes/{routeId}", routesHandler.UpdateRoute).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/routes/{routeId}", routesHandler.GetRoute).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/routes/{routeId}", routesHandler.DeleteRoute).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addDNSNameserversEndpoint() {
-	nameserversHandler := NewNameserversHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/dns/nameservers", nameserversHandler.GetAllNameservers).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/dns/nameservers", nameserversHandler.CreateNameserverGroup).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/dns/nameservers/{nsgroupId}", nameserversHandler.UpdateNameserverGroup).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/dns/nameservers/{nsgroupId}", nameserversHandler.GetNameserverGroup).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/dns/nameservers/{nsgroupId}", nameserversHandler.DeleteNameserverGroup).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addDNSSettingEndpoint() {
-	dnsSettingsHandler := NewDNSSettingsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/dns/settings", dnsSettingsHandler.GetDNSSettings).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/dns/settings", dnsSettingsHandler.UpdateDNSSettings).Methods("PUT", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addEventsEndpoint() {
-	eventsHandler := NewEventsHandler(apiHandler.AccountManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/events", eventsHandler.GetAllEvents).Methods("GET", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addPostureCheckEndpoint() {
-	postureCheckHandler := NewPostureChecksHandler(apiHandler.AccountManager, apiHandler.geolocationManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/posture-checks", postureCheckHandler.GetAllPostureChecks).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/posture-checks", postureCheckHandler.CreatePostureCheck).Methods("POST", "OPTIONS")
-	apiHandler.Router.HandleFunc("/posture-checks/{postureCheckId}", postureCheckHandler.UpdatePostureCheck).Methods("PUT", "OPTIONS")
-	apiHandler.Router.HandleFunc("/posture-checks/{postureCheckId}", postureCheckHandler.GetPostureCheck).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/posture-checks/{postureCheckId}", postureCheckHandler.DeletePostureCheck).Methods("DELETE", "OPTIONS")
-}
-
-func (apiHandler *apiHandler) addLocationsEndpoint() {
-	locationHandler := NewGeolocationsHandlerHandler(apiHandler.AccountManager, apiHandler.geolocationManager, apiHandler.AuthCfg)
-	apiHandler.Router.HandleFunc("/locations/countries", locationHandler.GetAllCountries).Methods("GET", "OPTIONS")
-	apiHandler.Router.HandleFunc("/locations/countries/{country}/cities", locationHandler.GetCitiesByCountry).Methods("GET", "OPTIONS")
+	return router, nil
 }

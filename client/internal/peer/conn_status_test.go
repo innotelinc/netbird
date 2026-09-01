@@ -1,8 +1,9 @@
 package peer
 
 import (
-	"github.com/magiconair/properties/assert"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestConnStatus_String(t *testing.T) {
@@ -13,7 +14,7 @@ func TestConnStatus_String(t *testing.T) {
 		want   string
 	}{
 		{"StatusConnected", StatusConnected, "Connected"},
-		{"StatusDisconnected", StatusDisconnected, "Disconnected"},
+		{"StatusIdle", StatusIdle, "Idle"},
 		{"StatusConnecting", StatusConnecting, "Connecting"},
 	}
 
@@ -23,5 +24,4 @@ func TestConnStatus_String(t *testing.T) {
 			assert.Equal(t, got, table.want, "they should be equal")
 		})
 	}
-
 }

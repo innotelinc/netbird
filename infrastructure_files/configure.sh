@@ -41,6 +41,30 @@ if [[ "x-$NETBIRD_DOMAIN" == "x-" ]]; then
   exit 1
 fi
 
+# Check if PostgreSQL is set as the store engine
+if [[ "$NETBIRD_STORE_CONFIG_ENGINE" == "postgres" ]]; then
+  # Exit if 'NETBIRD_STORE_ENGINE_POSTGRES_DSN' is not set
+  if [[ -z "$NETBIRD_STORE_ENGINE_POSTGRES_DSN" ]]; then
+    echo "Warning: NETBIRD_STORE_CONFIG_ENGINE=postgres but NETBIRD_STORE_ENGINE_POSTGRES_DSN is not set."
+    echo "Please add the following line to your setup.env file:"
+    echo 'NETBIRD_STORE_ENGINE_POSTGRES_DSN="host=<PG_HOST> user=<PG_USER> password=<PG_PASSWORD> dbname=<PG_DB_NAME> port=<PG_PORT>"'
+    exit 1
+  fi
+  export NETBIRD_STORE_ENGINE_POSTGRES_DSN
+fi
+
+# Check if MySQL is set as the store engine
+if [[ "$NETBIRD_STORE_CONFIG_ENGINE" == "mysql" ]]; then
+  # Exit if 'NETBIRD_STORE_ENGINE_MYSQL_DSN' is not set
+  if [[ -z "$NETBIRD_STORE_ENGINE_MYSQL_DSN" ]]; then
+    echo "Warning: NETBIRD_STORE_CONFIG_ENGINE=mysql but NETBIRD_STORE_ENGINE_MYSQL_DSN is not set."
+    echo "Please add the following line to your setup.env file:"
+    echo 'NETBIRD_STORE_ENGINE_MYSQL_DSN="<username>:<password>@tcp(127.0.0.1:3306)/<database>"'
+    exit 1
+  fi
+  export NETBIRD_STORE_ENGINE_MYSQL_DSN
+fi
+
 # local development or tests
 if [[ $NETBIRD_DOMAIN == "localhost" || $NETBIRD_DOMAIN == "127.0.0.1" ]]; then
   export NETBIRD_MGMT_SINGLE_ACCOUNT_MODE_DOMAIN="netbird.selfhosted"
@@ -76,6 +100,11 @@ else
 fi
 
 export TURN_EXTERNAL_IP_CONFIG
+
+# if not provided, we generate a relay auth secret
+if [[ "x-$NETBIRD_RELAY_AUTH_SECRET" == "x-" ]]; then
+  export NETBIRD_RELAY_AUTH_SECRET=$(openssl rand -base64 32 | sed 's/=//g')
+fi
 
 artifacts_path="./artifacts"
 mkdir -p $artifacts_path
@@ -141,6 +170,7 @@ fi
 if [[ "$NETBIRD_DISABLE_LETSENCRYPT" == "true" ]]; then
   export NETBIRD_DASHBOARD_ENDPOINT="https://$NETBIRD_DOMAIN:443"
   export NETBIRD_SIGNAL_ENDPOINT="https://$NETBIRD_DOMAIN:$NETBIRD_SIGNAL_PORT"
+  export NETBIRD_RELAY_ENDPOINT="rels://$NETBIRD_DOMAIN:$NETBIRD_RELAY_PORT/relay"
 
   echo "Letsencrypt was disabled, the Https-endpoints cannot be used anymore"
   echo " and a reverse-proxy with Https needs to be placed in front of netbird!"
@@ -149,15 +179,19 @@ if [[ "$NETBIRD_DISABLE_LETSENCRYPT" == "true" ]]; then
   echo "- $NETBIRD_MGMT_API_ENDPOINT/api -http-> management:$NETBIRD_MGMT_API_PORT"
   echo "- $NETBIRD_MGMT_API_ENDPOINT/management.ManagementService/ -grpc-> management:$NETBIRD_MGMT_API_PORT"
   echo "- $NETBIRD_SIGNAL_ENDPOINT/signalexchange.SignalExchange/ -grpc-> signal:80"
+  echo "- $NETBIRD_RELAY_ENDPOINT/ -http-> relay:33080"
   echo "You most likely also have to change NETBIRD_MGMT_API_ENDPOINT in base.setup.env and port-mappings in docker-compose.yml.tmpl and rerun this script."
   echo " The target of the forwards depends on your setup. Beware of the gRPC protocol instead of http for management and signal!"
   echo "You are also free to remove any occurrences of the Letsencrypt-volume $LETSENCRYPT_VOLUMENAME"
   echo ""
 
-  export NETBIRD_SIGNAL_PROTOCOL="https"
   unset NETBIRD_LETSENCRYPT_DOMAIN
   unset NETBIRD_MGMT_API_CERT_FILE
   unset NETBIRD_MGMT_API_CERT_KEY_FILE
+fi
+
+if [[ -n "$NETBIRD_MGMT_API_CERT_FILE" && -n "$NETBIRD_MGMT_API_CERT_KEY_FILE" ]]; then
+  export NETBIRD_SIGNAL_PROTOCOL="https"
 fi
 
 # Check if management identity provider is set

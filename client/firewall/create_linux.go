@@ -3,9 +3,10 @@
 package firewall
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/nftables"
@@ -15,6 +16,8 @@ import (
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
 	nbnftables "github.com/netbirdio/netbird/client/firewall/nftables"
 	"github.com/netbirdio/netbird/client/firewall/uspfilter"
+	nftypes "github.com/netbirdio/netbird/client/internal/netflow/types"
+	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
 
 const (
@@ -32,54 +35,79 @@ const SKIP_NFTABLES_ENV = "NB_SKIP_NFTABLES_CHECK"
 // FWType is the type for the firewall type
 type FWType int
 
-func NewFirewall(context context.Context, iface IFaceMapper) (firewall.Manager, error) {
-	// on the linux system we try to user nftables or iptables
-	// in any case, because we need to allow netbird interface traffic
-	// so we use AllowNetbird traffic from these firewall managers
-	// for the userspace packet filtering firewall
-	var fm firewall.Manager
-	var errFw error
+func NewFirewall(iface IFaceMapper, stateManager *statemanager.Manager, flowLogger nftypes.FlowLogger, disableServerRoutes bool, mtu uint16) (firewall.Manager, error) {
+	// We run in userspace mode and force userspace firewall was requested. We don't attempt native firewall.
+	if iface.IsUserspaceBind() && forceUserspaceFirewall() {
+		log.Info("forcing userspace firewall")
+		return createUserspaceFirewall(iface, nil, disableServerRoutes, flowLogger, mtu)
+	}
 
+	// Use native firewall for either kernel or userspace, the interface appears identical to netfilter
+	fm, err := createNativeFirewall(iface, stateManager, disableServerRoutes, mtu)
+
+	// Kernel cannot fall back to anything else, need to return error
+	if !iface.IsUserspaceBind() {
+		return fm, err
+	}
+
+	// Fall back to the userspace packet filter if native is unavailable
+	if err != nil {
+		log.Warnf("failed to create native firewall: %v. Proceeding with userspace", err)
+		return createUserspaceFirewall(iface, nil, disableServerRoutes, flowLogger, mtu)
+	}
+
+	// Native firewall handles packet filtering, but the userspace WireGuard bind
+	// needs a device filter for DNS interception hooks. Install a minimal
+	// hooks-only filter that passes all traffic through to the kernel firewall.
+	if err := iface.SetFilter(&uspfilter.HooksFilter{}); err != nil {
+		log.Warnf("failed to set hooks filter, DNS via memory hooks will not work: %v", err)
+	}
+
+	return fm, nil
+}
+
+func createNativeFirewall(iface IFaceMapper, stateManager *statemanager.Manager, routes bool, mtu uint16) (firewall.Manager, error) {
+	fm, err := createFW(iface, mtu)
+	if err != nil {
+		return nil, fmt.Errorf("create firewall: %s", err)
+	}
+
+	if err = fm.Init(stateManager); err != nil {
+		return nil, fmt.Errorf("init firewall: %s", err)
+	}
+
+	return fm, nil
+}
+
+func createFW(iface IFaceMapper, mtu uint16) (firewall.Manager, error) {
 	switch check() {
 	case IPTABLES:
 		log.Info("creating an iptables firewall manager")
-		fm, errFw = nbiptables.Create(context, iface)
-		if errFw != nil {
-			log.Errorf("failed to create iptables manager: %s", errFw)
-		}
+		return nbiptables.Create(iface, mtu)
 	case NFTABLES:
 		log.Info("creating an nftables firewall manager")
-		fm, errFw = nbnftables.Create(context, iface)
-		if errFw != nil {
-			log.Errorf("failed to create nftables manager: %s", errFw)
-		}
+		return nbnftables.Create(iface, mtu)
 	default:
-		errFw = fmt.Errorf("no firewall manager found")
 		log.Info("no firewall manager found, trying to use userspace packet filtering firewall")
+		return nil, errors.New("no firewall manager found")
+	}
+}
+
+func createUserspaceFirewall(iface IFaceMapper, fm firewall.Manager, disableServerRoutes bool, flowLogger nftypes.FlowLogger, mtu uint16) (firewall.Manager, error) {
+	var errUsp error
+	if fm != nil {
+		fm, errUsp = uspfilter.CreateWithNativeFirewall(iface, fm, disableServerRoutes, flowLogger, mtu)
+	} else {
+		fm, errUsp = uspfilter.Create(iface, disableServerRoutes, flowLogger, mtu)
 	}
 
-	if iface.IsUserspaceBind() {
-		var errUsp error
-		if errFw == nil {
-			fm, errUsp = uspfilter.CreateWithNativeFirewall(iface, fm)
-		} else {
-			fm, errUsp = uspfilter.Create(iface)
-		}
-		if errUsp != nil {
-			log.Debugf("failed to create userspace filtering firewall: %s", errUsp)
-			return nil, errUsp
-		}
-
-		if err := fm.AllowNetbird(); err != nil {
-			log.Errorf("failed to allow netbird interface traffic: %v", err)
-		}
-		return fm, nil
+	if errUsp != nil {
+		return nil, fmt.Errorf("create userspace firewall: %s", errUsp)
 	}
 
-	if errFw != nil {
-		return nil, errFw
+	if err := fm.AllowNetbird(); err != nil {
+		log.Errorf("failed to allow netbird interface traffic: %v", err)
 	}
-
 	return fm, nil
 }
 
@@ -146,4 +174,18 @@ func check() FWType {
 func isIptablesClientAvailable(client *iptables.IPTables) bool {
 	_, err := client.ListChains("filter")
 	return err == nil
+}
+
+func forceUserspaceFirewall() bool {
+	val := os.Getenv(EnvForceUserspaceFirewall)
+	if val == "" {
+		return false
+	}
+
+	force, err := strconv.ParseBool(val)
+	if err != nil {
+		log.Warnf("failed to parse %s: %v", EnvForceUserspaceFirewall, err)
+		return false
+	}
+	return force
 }

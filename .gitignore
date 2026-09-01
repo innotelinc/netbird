@@ -1,7 +1,9 @@
+.claude
 .idea
 .run
 *.iml
 dist/
+!proxy/web/dist/
 bin/
 .env
 conf.json
@@ -29,4 +31,7 @@ infrastructure_files/setup.env
 infrastructure_files/setup-*.env
 .vscode
 .DS_Store
-GeoLite2-City*
+vendor/
+/netbird
+client/netbird-electron/
+management/server/types/testdata/

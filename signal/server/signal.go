@@ -2,8 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"io"
+	"os"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -12,10 +13,13 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	gproto "google.golang.org/protobuf/proto"
 
+	"github.com/netbirdio/signal-dispatcher/dispatcher"
+
+	"github.com/netbirdio/netbird/shared/signal/proto"
 	"github.com/netbirdio/netbird/signal/metrics"
 	"github.com/netbirdio/netbird/signal/peer"
-	"github.com/netbirdio/netbird/signal/proto"
 )
 
 const (
@@ -25,35 +29,63 @@ const (
 	labelTypeNotRegistered = "not_registered"
 	labelTypeStream        = "stream"
 	labelTypeMessage       = "message"
+	labelTypeTimeout       = "timeout"
+	labelTypeDisconnected  = "disconnected"
 
-	labelError             = "error"
-	labelErrorMissingId    = "missing_id"
-	labelErrorMissingMeta  = "missing_meta"
-	labelErrorFailedHeader = "failed_header"
+	labelError                   = "error"
+	labelErrorMissingId          = "missing_id"
+	labelErrorMissingMeta        = "missing_meta"
+	labelErrorFailedHeader       = "failed_header"
+	labelErrorFailedRegistration = "failed_registration"
 
 	labelRegistrationStatus   = "status"
 	labelRegistrationFound    = "found"
 	labelRegistrationNotFound = "not_found"
+
+	sendTimeout = 10 * time.Second
+)
+
+var (
+	ErrPeerRegisteredAgain = errors.New("peer registered again")
 )
 
 // Server an instance of a Signal server
 type Server struct {
 	registry *peer.Registry
 	proto.UnimplementedSignalExchangeServer
+	dispatcher *dispatcher.Dispatcher
+	metrics    *metrics.AppMetrics
 
-	metrics *metrics.AppMetrics
+	successHeader metadata.MD
+
+	sendTimeout time.Duration
 }
 
 // NewServer creates a new Signal server
-func NewServer(meter metric.Meter) (*Server, error) {
-	appMetrics, err := metrics.NewAppMetrics(meter)
+func NewServer(ctx context.Context, meter metric.Meter, metricsPrefix ...string) (*Server, error) {
+	appMetrics, err := metrics.NewAppMetrics(meter, metricsPrefix...)
 	if err != nil {
 		return nil, fmt.Errorf("creating app metrics: %v", err)
 	}
 
+	d, err := dispatcher.NewDispatcher(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("creating dispatcher: %v", err)
+	}
+
+	sTimeout := sendTimeout
+	to := os.Getenv("NB_SIGNAL_SEND_TIMEOUT")
+	if parsed, err := time.ParseDuration(to); err == nil && parsed > 0 {
+		log.Trace("using custom send timeout ", parsed)
+		sTimeout = parsed
+	}
+
 	s := &Server{
-		registry: peer.NewRegistry(appMetrics),
-		metrics:  appMetrics,
+		dispatcher:    d,
+		registry:      peer.NewRegistry(appMetrics),
+		metrics:       appMetrics,
+		successHeader: metadata.Pairs(proto.HeaderRegistered, "1"),
+		sendTimeout:   sTimeout,
 	}
 
 	return s, nil
@@ -61,122 +93,117 @@ func NewServer(meter metric.Meter) (*Server, error) {
 
 // Send forwards a message to the signal peer
 func (s *Server) Send(ctx context.Context, msg *proto.EncryptedMessage) (*proto.EncryptedMessage, error) {
-	if !s.registry.IsPeerRegistered(msg.Key) {
-		s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeNotRegistered)))
+	log.Tracef("received a new message to send from peer [%s] to peer [%s]", msg.Key, msg.RemoteKey)
 
-		return nil, fmt.Errorf("peer %s is not registered", msg.Key)
+	if _, found := s.registry.Get(msg.RemoteKey); found {
+		s.forwardMessageToPeer(ctx, msg)
+		return &proto.EncryptedMessage{}, nil
 	}
 
-	getRegistrationStart := time.Now()
-
-	if dstPeer, found := s.registry.Get(msg.RemoteKey); found {
-		s.metrics.GetRegistrationDelay.Record(ctx, float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeMessage), attribute.String(labelRegistrationStatus, labelRegistrationFound)))
-		start := time.Now()
-		//forward the message to the target peer
-		if err := dstPeer.Stream.Send(msg); err != nil {
-			log.Errorf("error while forwarding message from peer [%s] to peer [%s] %v", msg.Key, msg.RemoteKey, err)
-			//todo respond to the sender?
-
-			s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeError)))
-		} else {
-			s.metrics.MessageForwardLatency.Record(ctx, float64(time.Since(start).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeMessage)))
-			s.metrics.MessagesForwarded.Add(context.Background(), 1)
-		}
-	} else {
-		s.metrics.GetRegistrationDelay.Record(ctx, float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeMessage), attribute.String(labelRegistrationStatus, labelRegistrationNotFound)))
-		log.Debugf("message from peer [%s] can't be forwarded to peer [%s] because destination peer is not connected", msg.Key, msg.RemoteKey)
-		//todo respond to the sender?
-
-		s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeNotConnected)))
-	}
-	return &proto.EncryptedMessage{}, nil
+	return s.dispatcher.SendMessage(ctx, msg)
 }
 
 // ConnectStream connects to the exchange stream
 func (s *Server) ConnectStream(stream proto.SignalExchange_ConnectStreamServer) error {
-	p, err := s.connectPeer(stream)
+	ctx, cancel := context.WithCancel(context.Background())
+	p, err := s.RegisterPeer(stream, cancel)
 	if err != nil {
 		return err
 	}
 
-	startRegister := time.Now()
+	defer s.DeregisterPeer(p)
 
-	s.metrics.ActivePeers.Add(stream.Context(), 1)
-
-	defer func() {
-		log.Infof("peer disconnected [%s] [streamID %d] ", p.Id, p.StreamID)
-		s.registry.Deregister(p)
-
-		s.metrics.PeerConnectionDuration.Record(stream.Context(), int64(time.Since(startRegister).Seconds()))
-		s.metrics.ActivePeers.Add(context.Background(), -1)
-	}()
-
-	//needed to confirm that the peer has been registered so that the client can proceed
-	header := metadata.Pairs(proto.HeaderRegistered, "1")
-	err = stream.SendHeader(header)
+	// needed to confirm that the peer has been registered so that the client can proceed
+	err = stream.SendHeader(s.successHeader)
 	if err != nil {
 		s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorFailedHeader)))
 		return err
 	}
 
-	log.Infof("peer connected [%s] [streamID %d] ", p.Id, p.StreamID)
+	log.Debugf("peer connected [%s] [streamID %d] ", p.Id, p.StreamID)
 
-	for {
-
-		//read incoming messages
-		msg, err := stream.Recv()
-		if err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		log.Debugf("received a new message from peer [%s] to peer [%s]", p.Id, msg.RemoteKey)
-
-		getRegistrationStart := time.Now()
-
-		// lookup the target peer where the message is going to
-		if dstPeer, found := s.registry.Get(msg.RemoteKey); found {
-			s.metrics.GetRegistrationDelay.Record(stream.Context(), float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream), attribute.String(labelRegistrationStatus, labelRegistrationFound)))
-			start := time.Now()
-			//forward the message to the target peer
-			if err := dstPeer.Stream.Send(msg); err != nil {
-				log.Errorf("error while forwarding message from peer [%s] to peer [%s] %v", p.Id, msg.RemoteKey, err)
-				//todo respond to the sender?
-				s.metrics.MessageForwardFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelType, labelTypeError)))
-			} else {
-				// in milliseconds
-				s.metrics.MessageForwardLatency.Record(stream.Context(), float64(time.Since(start).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream)))
-				s.metrics.MessagesForwarded.Add(stream.Context(), 1)
-			}
-		} else {
-			s.metrics.GetRegistrationDelay.Record(stream.Context(), float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream), attribute.String(labelRegistrationStatus, labelRegistrationNotFound)))
-			s.metrics.MessageForwardFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelType, labelTypeNotConnected)))
-			log.Debugf("message from peer [%s] can't be forwarded to peer [%s] because destination peer is not connected", p.Id, msg.RemoteKey)
-			//todo respond to the sender?
-		}
+	select {
+	case <-stream.Context().Done():
+		log.Debugf("peer stream closing [%s] [streamID %d] ", p.Id, p.StreamID)
+		return nil
+	case <-ctx.Done():
+		return ErrPeerRegisteredAgain
 	}
-	<-stream.Context().Done()
-	return stream.Context().Err()
 }
 
-// Handles initial Peer connection.
-// Each connection must provide an Id header.
-// At this moment the connecting Peer will be registered in the peer.Registry
-func (s Server) connectPeer(stream proto.SignalExchange_ConnectStreamServer) (*peer.Peer, error) {
-	if meta, hasMeta := metadata.FromIncomingContext(stream.Context()); hasMeta {
-		if id, found := meta[proto.HeaderId]; found {
-			p := peer.NewPeer(id[0], stream)
+func (s *Server) RegisterPeer(stream proto.SignalExchange_ConnectStreamServer, cancel context.CancelFunc) (*peer.Peer, error) {
+	log.Debugf("registering new peer")
+	id := metadata.ValueFromIncomingContext(stream.Context(), proto.HeaderId)
+	if id == nil {
+		s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorMissingId)))
+		return nil, status.Errorf(codes.FailedPrecondition, "missing connection header: %s", proto.HeaderId)
+	}
 
-			s.registry.Register(p)
+	p := peer.NewPeer(id[0], stream, cancel)
+	if err := s.registry.Register(p); err != nil {
+		return nil, err
+	}
+	err := s.dispatcher.ListenForMessages(stream.Context(), p.Id, s.forwardMessageToPeer)
+	if err != nil {
+		s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorFailedRegistration)))
+		log.Errorf("error while registering message listener for peer [%s] %v", p.Id, err)
+		return nil, status.Errorf(codes.Internal, "error while registering message listener")
+	}
+	return p, nil
+}
 
-			return p, nil
-		} else {
-			s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorMissingId)))
-			return nil, status.Errorf(codes.FailedPrecondition, "missing connection header: "+proto.HeaderId)
+func (s *Server) DeregisterPeer(p *peer.Peer) {
+	log.Debugf("peer disconnected [%s] [streamID %d] ", p.Id, p.StreamID)
+	s.metrics.PeerConnectionDuration.Record(p.Stream.Context(), int64(time.Since(p.RegisteredAt).Seconds()))
+	s.registry.Deregister(p)
+}
+
+func (s *Server) forwardMessageToPeer(ctx context.Context, msg *proto.EncryptedMessage) {
+	log.Tracef("forwarding a new message from peer [%s] to peer [%s]", msg.Key, msg.RemoteKey)
+	getRegistrationStart := time.Now()
+
+	// lookup the target peer where the message is going to
+	dstPeer, found := s.registry.Get(msg.RemoteKey)
+
+	if !found {
+		s.metrics.GetRegistrationDelay.Record(ctx, float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream), attribute.String(labelRegistrationStatus, labelRegistrationNotFound)))
+		s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeNotConnected)))
+		log.Tracef("message from peer [%s] can't be forwarded to peer [%s] because destination peer is not connected", msg.Key, msg.RemoteKey)
+		// todo respond to the sender?
+		return
+	}
+
+	s.metrics.GetRegistrationDelay.Record(ctx, float64(time.Since(getRegistrationStart).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream), attribute.String(labelRegistrationStatus, labelRegistrationFound)))
+	start := time.Now()
+
+	sendResultChan := make(chan error, 1)
+	go func() {
+		select {
+		case sendResultChan <- dstPeer.Send(msg):
+			return
+		case <-dstPeer.Stream.Context().Done():
+			return
 		}
-	} else {
-		s.metrics.RegistrationFailures.Add(stream.Context(), 1, metric.WithAttributes(attribute.String(labelError, labelErrorMissingMeta)))
-		return nil, status.Errorf(codes.FailedPrecondition, "missing connection stream meta")
+	}()
+
+	select {
+	case err := <-sendResultChan:
+		if err != nil {
+			log.Tracef("error while forwarding message from peer [%s] to peer [%s]: %v", msg.Key, msg.RemoteKey, err)
+			s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeError)))
+			return
+		}
+		s.metrics.MessageForwardLatency.Record(ctx, float64(time.Since(start).Nanoseconds())/1e6, metric.WithAttributes(attribute.String(labelType, labelTypeStream)))
+		s.metrics.MessagesForwarded.Add(ctx, 1)
+		s.metrics.MessageSize.Record(ctx, int64(gproto.Size(msg)), metric.WithAttributes(attribute.String(labelType, labelTypeMessage)))
+
+	case <-dstPeer.Stream.Context().Done():
+		log.Tracef("failed to forward message from peer [%s] to peer [%s]: destination peer disconnected", msg.Key, msg.RemoteKey)
+		s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeDisconnected)))
+
+	case <-time.After(s.sendTimeout):
+		dstPeer.Cancel() // cancel the peer context to trigger deregistration
+		log.Tracef("failed to forward message from peer [%s] to peer [%s]: send timeout", msg.Key, msg.RemoteKey)
+		s.metrics.MessageForwardFailures.Add(ctx, 1, metric.WithAttributes(attribute.String(labelType, labelTypeTimeout)))
 	}
 }

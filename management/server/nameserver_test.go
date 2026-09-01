@@ -4,13 +4,28 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
 
+	"go.uber.org/mock/gomock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	nbdns "github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/update_channel"
+	"github.com/netbirdio/netbird/management/internals/modules/peers"
+	ephemeral_manager "github.com/netbirdio/netbird/management/internals/modules/peers/ephemeral/manager"
+	"github.com/netbirdio/netbird/management/internals/server/config"
 	"github.com/netbirdio/netbird/management/server/activity"
-	nbgroup "github.com/netbirdio/netbird/management/server/group"
+	"github.com/netbirdio/netbird/management/server/cache"
+	"github.com/netbirdio/netbird/management/server/integrations/port_forwarding"
+	"github.com/netbirdio/netbird/management/server/job"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
+	"github.com/netbirdio/netbird/management/server/permissions"
+	"github.com/netbirdio/netbird/management/server/settings"
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/telemetry"
+	"github.com/netbirdio/netbird/management/server/types"
 )
 
 const (
@@ -375,12 +390,12 @@ func TestCreateNameServerGroup(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			am, err := createNSManager(t)
 			if err != nil {
-				t.Error("failed to create account manager")
+				t.Fatalf("failed to create account manager: %s", err)
 			}
 
 			account, err := initTestNSAccount(t, am)
 			if err != nil {
-				t.Error("failed to init testing account")
+				t.Fatalf("failed to init testing account: %s", err)
 			}
 
 			outNSGroup, err := am.CreateNameServerGroup(
@@ -603,12 +618,12 @@ func TestSaveNameServerGroup(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			am, err := createNSManager(t)
 			if err != nil {
-				t.Error("failed to create account manager")
+				t.Fatalf("failed to create account manager: %s", err)
 			}
 
 			account, err := initTestNSAccount(t, am)
 			if err != nil {
-				t.Error("failed to init testing account")
+				t.Fatalf("failed to init testing account: %s", err)
 			}
 
 			account.NameServerGroups[testCase.existingNSGroup.ID] = testCase.existingNSGroup
@@ -702,7 +717,7 @@ func TestDeleteNameServerGroup(t *testing.T) {
 
 	account, err := initTestNSAccount(t, am)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	account.NameServerGroups[testingNSGroup.ID] = testingNSGroup
@@ -737,7 +752,7 @@ func TestGetNameServerGroup(t *testing.T) {
 
 	account, err := initTestNSAccount(t, am)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	foundGroup, err := am.GetNameServerGroup(context.Background(), account.Id, testUserID, existingNSGroupID)
@@ -757,18 +772,46 @@ func TestGetNameServerGroup(t *testing.T) {
 
 func createNSManager(t *testing.T) (*DefaultAccountManager, error) {
 	t.Helper()
+
 	store, err := createNSStore(t)
 	if err != nil {
 		return nil, err
 	}
 	eventStore := &activity.InMemoryEventStore{}
-	return BuildManager(context.Background(), store, NewPeersUpdateManager(nil), nil, "", "netbird.selfhosted", eventStore, nil, false, MocIntegratedValidator{})
+
+	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
+	require.NoError(t, err)
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+	settingsMockManager := settings.NewMockManager(ctrl)
+	settingsMockManager.
+		EXPECT().
+		GetExtraSettings(gomock.Any(), gomock.Any()).
+		Return(&types.ExtraSettings{}, nil).
+		AnyTimes()
+
+	permissionsManager := permissions.NewManager(store)
+	peersManager := peers.NewManager(store, permissionsManager)
+
+	ctx := context.Background()
+
+	cacheStore, err := cache.NewStore(ctx, 100*time.Millisecond, 300*time.Millisecond, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	updateManager := update_channel.NewPeersUpdateManager(metrics)
+	requestBuffer := NewAccountRequestBuffer(ctx, store)
+	networkMapController := controller.NewController(ctx, store, metrics, updateManager, requestBuffer, MockIntegratedValidator{}, settingsMockManager, "netbird.selfhosted", port_forwarding.NewControllerMock(), ephemeral_manager.NewEphemeralManager(store, peers.NewManager(store, permissionsManager)), &config.Config{}, nil)
+
+	return BuildManager(context.Background(), nil, store, networkMapController, job.NewJobManager(nil, store, peersManager), nil, "", eventStore, nil, false, MockIntegratedValidator{}, metrics, port_forwarding.NewControllerMock(), settingsMockManager, permissionsManager, false, cacheStore)
 }
 
-func createNSStore(t *testing.T) (Store, error) {
+func createNSStore(t *testing.T) (store.Store, error) {
 	t.Helper()
 	dataDir := t.TempDir()
-	store, cleanUp, err := NewTestStoreFromJson(context.Background(), dataDir)
+	store, cleanUp, err := store.NewTestStoreFromSQL(context.Background(), "", dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -777,7 +820,7 @@ func createNSStore(t *testing.T) (Store, error) {
 	return store, nil
 }
 
-func initTestNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, error) {
+func initTestNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account, error) {
 	t.Helper()
 	peer1 := &nbpeer.Peer{
 		Key:  nsGroupPeer1Key,
@@ -831,16 +874,16 @@ func initTestNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, error
 	userID := testUserID
 	domain := "example.com"
 
-	account := newAccountWithId(context.Background(), accountID, userID, domain)
+	account := newAccountWithId(context.Background(), accountID, userID, domain, "", "", false)
 
 	account.NameServerGroups[existingNSGroup.ID] = &existingNSGroup
 
-	newGroup1 := &nbgroup.Group{
+	newGroup1 := &types.Group{
 		ID:   group1ID,
 		Name: group1ID,
 	}
 
-	newGroup2 := &nbgroup.Group{
+	newGroup2 := &types.Group{
 		ID:   group2ID,
 		Name: group2ID,
 	}
@@ -853,11 +896,11 @@ func initTestNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, error
 		return nil, err
 	}
 
-	_, _, _, err = am.AddPeer(context.Background(), "", userID, peer1)
+	_, _, _, _, err = am.AddPeer(context.Background(), "", "", userID, peer1, false)
 	if err != nil {
 		return nil, err
 	}
-	_, _, _, err = am.AddPeer(context.Background(), "", userID, peer2)
+	_, _, _, _, err = am.AddPeer(context.Background(), "", "", userID, peer2, false)
 	if err != nil {
 		return nil, err
 	}
@@ -865,60 +908,51 @@ func initTestNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, error
 	return account, nil
 }
 
+// TestValidateDomain tests nameserver-specific domain validation.
+// Core domain validation is tested in shared/management/domain/validate_test.go.
+// This test only covers nameserver-specific behavior: wildcard rejection and unicode support.
 func TestValidateDomain(t *testing.T) {
 	testCases := []struct {
 		name    string
 		domain  string
 		errFunc require.ErrorAssertionFunc
 	}{
+		// Nameserver-specific: wildcards not allowed
 		{
-			name:    "Valid domain name with multiple labels",
-			domain:  "123.example.com",
+			name:    "Wildcard prefix rejected",
+			domain:  "*.example.com",
+			errFunc: require.Error,
+		},
+		{
+			name:    "Wildcard in middle rejected",
+			domain:  "a.*.example.com",
+			errFunc: require.Error,
+		},
+		// Nameserver-specific: unicode converted to punycode
+		{
+			name:    "Unicode domain converted to punycode",
+			domain:  "münchen.de",
 			errFunc: require.NoError,
 		},
 		{
-			name:    "Valid domain name with hyphen",
-			domain:  "test-example.com",
+			name:    "Unicode domain all labels",
+			domain:  "中国.中国",
+			errFunc: require.NoError,
+		},
+		// Basic validation still works (delegates to shared validation)
+		{
+			name:    "Valid multi-label domain",
+			domain:  "example.com",
 			errFunc: require.NoError,
 		},
 		{
-			name:    "Invalid domain name with double hyphen",
-			domain:  "test--example.com",
-			errFunc: require.Error,
+			name:    "Valid single label",
+			domain:  "internal",
+			errFunc: require.NoError,
 		},
 		{
-			name:    "Invalid domain name with only one label",
-			domain:  "com",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain name with a label exceeding 63 characters",
-			domain:  "dnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdnsdns.com",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain name starting with a hyphen",
+			name:    "Invalid leading hyphen",
 			domain:  "-example.com",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain name ending with a hyphen",
-			domain:  "example.com-",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain with unicode",
-			domain:  "example?,.com",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain with space before top-level domain",
-			domain:  "space .example.com",
-			errFunc: require.Error,
-		},
-		{
-			name:    "Invalid domain with trailing space",
-			domain:  "example.com ",
 			errFunc: require.Error,
 		},
 	}
@@ -929,4 +963,150 @@ func TestValidateDomain(t *testing.T) {
 		})
 	}
 
+}
+
+func TestNameServerAccountPeersUpdate(t *testing.T) {
+	manager, updateManager, account, peer1, peer2, peer3 := setupNetworkMapTest(t)
+
+	var newNameServerGroupA *nbdns.NameServerGroup
+	var newNameServerGroupB *nbdns.NameServerGroup
+
+	err := manager.CreateGroup(context.Background(), account.Id, userID, &types.Group{
+		ID:    "groupA",
+		Name:  "GroupA",
+		Peers: []string{},
+	})
+	assert.NoError(t, err)
+
+	err = manager.CreateGroup(context.Background(), account.Id, userID, &types.Group{
+		ID:    "groupB",
+		Name:  "GroupB",
+		Peers: []string{peer1.ID, peer2.ID, peer3.ID},
+	})
+	assert.NoError(t, err)
+
+	updMsg := updateManager.CreateChannel(context.Background(), peer1.ID)
+	t.Cleanup(func() {
+		updateManager.CloseChannel(context.Background(), peer1.ID)
+	})
+
+	// Creating a nameserver group with a distribution group no peers should not update account peers
+	// and not send peer update
+	t.Run("creating nameserver group with distribution group no peers", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldNotReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		newNameServerGroupA, err = manager.CreateNameServerGroup(
+			context.Background(), account.Id, "nsGroupA", "nsGroupA", []nbdns.NameServer{{
+				IP:     netip.MustParseAddr("1.1.1.1"),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			}},
+			[]string{"groupA"},
+			true, []string{}, true, userID, false,
+		)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// saving a nameserver group with a distribution group with no peers should not update account peers
+	// and not send peer update
+	t.Run("saving nameserver group with distribution group no peers", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldNotReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err = manager.SaveNameServerGroup(context.Background(), account.Id, userID, newNameServerGroupA)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// Creating a nameserver group with a distribution group no peers should update account peers and send peer update
+	t.Run("creating nameserver group with distribution group has peers", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		newNameServerGroupB, err = manager.CreateNameServerGroup(
+			context.Background(), account.Id, "nsGroupB", "nsGroupB", []nbdns.NameServer{{
+				IP:     netip.MustParseAddr("1.1.1.1"),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			}},
+			[]string{"groupB"},
+			true, []string{}, true, userID, false,
+		)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// saving a nameserver group with a distribution group with peers should update account peers and send peer update
+	t.Run("saving nameserver group with distribution group has peers", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		newNameServerGroupB.NameServers = []nbdns.NameServer{
+			{
+				IP:     netip.MustParseAddr("1.1.1.2"),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			},
+			{
+				IP:     netip.MustParseAddr("8.8.8.8"),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			},
+		}
+		err = manager.SaveNameServerGroup(context.Background(), account.Id, userID, newNameServerGroupB)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(peerUpdateTimeout):
+			t.Error("timeout waiting for peerShouldReceiveUpdate")
+		}
+	})
+
+	// Deleting a nameserver group should update account peers and send peer update
+	t.Run("deleting nameserver group", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err = manager.DeleteNameServerGroup(context.Background(), account.Id, newNameServerGroupB.ID, userID)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(peerUpdateTimeout):
+			t.Error("timeout waiting for peerShouldReceiveUpdate")
+		}
+	})
 }

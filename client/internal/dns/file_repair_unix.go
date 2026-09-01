@@ -3,12 +3,15 @@
 package dns
 
 import (
+	"net/netip"
 	"path"
 	"path/filepath"
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/client/internal/statemanager"
 )
 
 var (
@@ -20,7 +23,7 @@ var (
 	}
 )
 
-type repairConfFn func([]string, string, *resolvConf) error
+type repairConfFn func([]string, netip.Addr, *resolvConf, *statemanager.Manager) error
 
 type repair struct {
 	operationFile string
@@ -40,7 +43,7 @@ func newRepair(operationFile string, updateFn repairConfFn) *repair {
 	}
 }
 
-func (f *repair) watchFileChanges(nbSearchDomains []string, nbNameserverIP string) {
+func (f *repair) watchFileChanges(nbSearchDomains []string, nbNameserverIP netip.Addr, stateManager *statemanager.Manager) {
 	if f.inotify != nil {
 		return
 	}
@@ -81,7 +84,7 @@ func (f *repair) watchFileChanges(nbSearchDomains []string, nbNameserverIP strin
 				log.Errorf("failed to rm inotify watch for resolv.conf: %s", err)
 			}
 
-			err = f.updateFn(nbSearchDomains, nbNameserverIP, rConf)
+			err = f.updateFn(nbSearchDomains, nbNameserverIP, rConf, stateManager)
 			if err != nil {
 				log.Errorf("failed to repair resolv.conf: %v", err)
 			}
@@ -134,7 +137,7 @@ func (f *repair) isEventRelevant(event fsnotify.Event) bool {
 // nbParamsAreMissing checks if the resolv.conf file contains all the parameters that NetBird needs
 // check the NetBird related nameserver IP at the first place
 // check the NetBird related search domains in the search domains list
-func isNbParamsMissing(nbSearchDomains []string, nbNameserverIP string, rConf *resolvConf) bool {
+func isNbParamsMissing(nbSearchDomains []string, nbNameserverIP netip.Addr, rConf *resolvConf) bool {
 	if !isContains(nbSearchDomains, rConf.searchDomains) {
 		return true
 	}

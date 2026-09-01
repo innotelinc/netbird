@@ -1,18 +1,21 @@
+//go:build ios
+
 package NetBirdSDK
 
 import (
-	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/profilemanager"
 )
 
 // Preferences export a subset of the internal config for gomobile
 type Preferences struct {
-	configInput internal.ConfigInput
+	configInput profilemanager.ConfigInput
 }
 
 // NewPreferences create new Preferences instance
-func NewPreferences(configPath string) *Preferences {
-	ci := internal.ConfigInput{
-		ConfigPath: configPath,
+func NewPreferences(configPath string, stateFilePath string) *Preferences {
+	ci := profilemanager.ConfigInput{
+		ConfigPath:    configPath,
+		StateFilePath: stateFilePath,
 	}
 	return &Preferences{ci}
 }
@@ -23,7 +26,7 @@ func (p *Preferences) GetManagementURL() (string, error) {
 		return p.configInput.ManagementURL, nil
 	}
 
-	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
 	if err != nil {
 		return "", err
 	}
@@ -41,7 +44,7 @@ func (p *Preferences) GetAdminURL() (string, error) {
 		return p.configInput.AdminURL, nil
 	}
 
-	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
 	if err != nil {
 		return "", err
 	}
@@ -59,7 +62,7 @@ func (p *Preferences) GetPreSharedKey() (string, error) {
 		return *p.configInput.PreSharedKey, nil
 	}
 
-	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
 	if err != nil {
 		return "", err
 	}
@@ -82,7 +85,7 @@ func (p *Preferences) GetRosenpassEnabled() (bool, error) {
 		return *p.configInput.RosenpassEnabled, nil
 	}
 
-	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
 	if err != nil {
 		return false, err
 	}
@@ -100,15 +103,35 @@ func (p *Preferences) GetRosenpassPermissive() (bool, error) {
 		return *p.configInput.RosenpassPermissive, nil
 	}
 
-	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
 	if err != nil {
 		return false, err
 	}
 	return cfg.RosenpassPermissive, err
 }
 
+// GetDisableIPv6 reads disable IPv6 setting from config file
+func (p *Preferences) GetDisableIPv6() (bool, error) {
+	if p.configInput.DisableIPv6 != nil {
+		return *p.configInput.DisableIPv6, nil
+	}
+
+	cfg, err := profilemanager.ReadConfig(p.configInput.ConfigPath)
+	if err != nil {
+		return false, err
+	}
+	return cfg.DisableIPv6, err
+}
+
+// SetDisableIPv6 stores the given value and waits for commit
+func (p *Preferences) SetDisableIPv6(disable bool) {
+	p.configInput.DisableIPv6 = &disable
+}
+
 // Commit write out the changes into config file
 func (p *Preferences) Commit() error {
-	_, err := internal.UpdateOrCreateConfig(p.configInput)
+	// Use DirectUpdateOrCreateConfig to avoid atomic file operations (temp file + rename)
+	// which are blocked by the tvOS sandbox in App Group containers
+	_, err := profilemanager.DirectUpdateOrCreateConfig(p.configInput)
 	return err
 }

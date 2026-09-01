@@ -20,14 +20,16 @@ const defaultEndpoint = "/metrics"
 
 // MockAppMetrics mocks the AppMetrics interface
 type MockAppMetrics struct {
-	GetMeterFunc             func() metric2.Meter
-	CloseFunc                func() error
-	ExposeFunc               func(ctx context.Context, port int, endpoint string) error
-	IDPMetricsFunc           func() *IDPMetrics
-	HTTPMiddlewareFunc       func() *HTTPMiddleware
-	GRPCMetricsFunc          func() *GRPCMetrics
-	StoreMetricsFunc         func() *StoreMetrics
-	UpdateChannelMetricsFunc func() *UpdateChannelMetrics
+	GetMeterFunc                 func() metric2.Meter
+	CloseFunc                    func() error
+	ExposeFunc                   func(ctx context.Context, port int, endpoint string) error
+	IDPMetricsFunc               func() *IDPMetrics
+	HTTPMiddlewareFunc           func() *HTTPMiddleware
+	GRPCMetricsFunc              func() *GRPCMetrics
+	StoreMetricsFunc             func() *StoreMetrics
+	UpdateChannelMetricsFunc     func() *UpdateChannelMetrics
+	AddAccountManagerMetricsFunc func() *AccountManagerMetrics
+	EphemeralPeersMetricsFunc    func() *EphemeralPeersMetrics
 }
 
 // GetMeter mocks the GetMeter function of the AppMetrics interface
@@ -94,6 +96,22 @@ func (mock *MockAppMetrics) UpdateChannelMetrics() *UpdateChannelMetrics {
 	return nil
 }
 
+// AccountManagerMetrics mocks the MockAppMetrics function of the AccountManagerMetrics interface
+func (mock *MockAppMetrics) AccountManagerMetrics() *AccountManagerMetrics {
+	if mock.AddAccountManagerMetricsFunc != nil {
+		return mock.AddAccountManagerMetricsFunc()
+	}
+	return nil
+}
+
+// EphemeralPeersMetrics mocks the MockAppMetrics function of the EphemeralPeersMetrics interface
+func (mock *MockAppMetrics) EphemeralPeersMetrics() *EphemeralPeersMetrics {
+	if mock.EphemeralPeersMetricsFunc != nil {
+		return mock.EphemeralPeersMetricsFunc()
+	}
+	return nil
+}
+
 // AppMetrics is metrics interface
 type AppMetrics interface {
 	GetMeter() metric2.Meter
@@ -104,19 +122,24 @@ type AppMetrics interface {
 	GRPCMetrics() *GRPCMetrics
 	StoreMetrics() *StoreMetrics
 	UpdateChannelMetrics() *UpdateChannelMetrics
+	AccountManagerMetrics() *AccountManagerMetrics
+	EphemeralPeersMetrics() *EphemeralPeersMetrics
 }
 
 // defaultAppMetrics are core application metrics based on OpenTelemetry https://opentelemetry.io/
 type defaultAppMetrics struct {
 	// Meter can be used by different application parts to create counters and measure things
-	Meter                metric2.Meter
-	listener             net.Listener
-	ctx                  context.Context
-	idpMetrics           *IDPMetrics
-	httpMiddleware       *HTTPMiddleware
-	grpcMetrics          *GRPCMetrics
-	storeMetrics         *StoreMetrics
-	updateChannelMetrics *UpdateChannelMetrics
+	Meter                 metric2.Meter
+	listener              net.Listener
+	ctx                   context.Context
+	externallyManaged     bool
+	idpMetrics            *IDPMetrics
+	httpMiddleware        *HTTPMiddleware
+	grpcMetrics           *GRPCMetrics
+	storeMetrics          *StoreMetrics
+	updateChannelMetrics  *UpdateChannelMetrics
+	accountManagerMetrics *AccountManagerMetrics
+	ephemeralMetrics      *EphemeralPeersMetrics
 }
 
 // IDPMetrics returns metrics for the idp package
@@ -144,6 +167,16 @@ func (appMetrics *defaultAppMetrics) UpdateChannelMetrics() *UpdateChannelMetric
 	return appMetrics.updateChannelMetrics
 }
 
+// AccountManagerMetrics returns metrics for the account manager
+func (appMetrics *defaultAppMetrics) AccountManagerMetrics() *AccountManagerMetrics {
+	return appMetrics.accountManagerMetrics
+}
+
+// EphemeralPeersMetrics returns metrics for the ephemeral peer cleanup loop
+func (appMetrics *defaultAppMetrics) EphemeralPeersMetrics() *EphemeralPeersMetrics {
+	return appMetrics.ephemeralMetrics
+}
+
 // Close stop application metrics HTTP handler and closes listener.
 func (appMetrics *defaultAppMetrics) Close() error {
 	if appMetrics.listener == nil {
@@ -155,6 +188,9 @@ func (appMetrics *defaultAppMetrics) Close() error {
 // Expose metrics on a given port and endpoint. If endpoint is empty a defaultEndpoint one will be used.
 // Exposes metrics in the Prometheus format https://prometheus.io/
 func (appMetrics *defaultAppMetrics) Expose(ctx context.Context, port int, endpoint string) error {
+	if appMetrics.externallyManaged {
+		return nil
+	}
 	if endpoint == "" {
 		endpoint = defaultEndpoint
 	}
@@ -168,10 +204,10 @@ func (appMetrics *defaultAppMetrics) Expose(ctx context.Context, port int, endpo
 	}
 	appMetrics.listener = listener
 	go func() {
-		err := http.Serve(listener, rootRouter)
-		if err != nil {
-			return
+		if err := http.Serve(listener, rootRouter); err != nil && err != http.ErrServerClosed {
+			log.WithContext(ctx).Errorf("metrics server error: %v", err)
 		}
+		log.WithContext(ctx).Info("metrics server stopped")
 	}()
 
 	log.WithContext(ctx).Infof("enabled application metrics and exposing on http://%s", listener.Addr().String())
@@ -188,7 +224,7 @@ func (appMetrics *defaultAppMetrics) GetMeter() metric2.Meter {
 func NewDefaultAppMetrics(ctx context.Context) (AppMetrics, error) {
 	exporter, err := prometheus.New()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create prometheus exporter: %w", err)
 	}
 
 	provider := metric.NewMeterProvider(metric.WithReader(exporter))
@@ -197,36 +233,100 @@ func NewDefaultAppMetrics(ctx context.Context) (AppMetrics, error) {
 
 	idpMetrics, err := NewIDPMetrics(ctx, meter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize IDP metrics: %w", err)
 	}
 
 	middleware, err := NewMetricsMiddleware(ctx, meter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize HTTP middleware metrics: %w", err)
 	}
 
 	grpcMetrics, err := NewGRPCMetrics(ctx, meter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize gRPC metrics: %w", err)
 	}
 
 	storeMetrics, err := NewStoreMetrics(ctx, meter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize store metrics: %w", err)
 	}
 
 	updateChannelMetrics, err := NewUpdateChannelMetrics(ctx, meter)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize update channel metrics: %w", err)
+	}
+
+	accountManagerMetrics, err := NewAccountManagerMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize account manager metrics: %w", err)
+	}
+
+	ephemeralMetrics, err := NewEphemeralPeersMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize ephemeral peers metrics: %w", err)
 	}
 
 	return &defaultAppMetrics{
-		Meter:                meter,
-		ctx:                  ctx,
-		idpMetrics:           idpMetrics,
-		httpMiddleware:       middleware,
-		grpcMetrics:          grpcMetrics,
-		storeMetrics:         storeMetrics,
-		updateChannelMetrics: updateChannelMetrics,
+		Meter:                 meter,
+		ctx:                   ctx,
+		idpMetrics:            idpMetrics,
+		httpMiddleware:        middleware,
+		grpcMetrics:           grpcMetrics,
+		storeMetrics:          storeMetrics,
+		updateChannelMetrics:  updateChannelMetrics,
+		accountManagerMetrics: accountManagerMetrics,
+		ephemeralMetrics:      ephemeralMetrics,
+	}, nil
+}
+
+// NewAppMetricsWithMeter creates AppMetrics using an externally provided meter.
+// The caller is responsible for exposing metrics via HTTP. Expose() and Close() are no-ops.
+func NewAppMetricsWithMeter(ctx context.Context, meter metric2.Meter) (AppMetrics, error) {
+	idpMetrics, err := NewIDPMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize IDP metrics: %w", err)
+	}
+
+	middleware, err := NewMetricsMiddleware(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize HTTP middleware metrics: %w", err)
+	}
+
+	grpcMetrics, err := NewGRPCMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize gRPC metrics: %w", err)
+	}
+
+	storeMetrics, err := NewStoreMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize store metrics: %w", err)
+	}
+
+	updateChannelMetrics, err := NewUpdateChannelMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize update channel metrics: %w", err)
+	}
+
+	accountManagerMetrics, err := NewAccountManagerMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize account manager metrics: %w", err)
+	}
+
+	ephemeralMetrics, err := NewEphemeralPeersMetrics(ctx, meter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize ephemeral peers metrics: %w", err)
+	}
+
+	return &defaultAppMetrics{
+		Meter:                 meter,
+		ctx:                   ctx,
+		externallyManaged:     true,
+		idpMetrics:            idpMetrics,
+		httpMiddleware:        middleware,
+		grpcMetrics:           grpcMetrics,
+		storeMetrics:          storeMetrics,
+		updateChannelMetrics:  updateChannelMetrics,
+		accountManagerMetrics: accountManagerMetrics,
+		ephemeralMetrics:      ephemeralMetrics,
 	}, nil
 }

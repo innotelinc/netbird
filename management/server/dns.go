@@ -2,256 +2,147 @@ package server
 
 import (
 	"context"
-	"fmt"
-	"strconv"
+	"slices"
 
-	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
 
 	nbdns "github.com/netbirdio/netbird/dns"
-	"github.com/netbirdio/netbird/management/proto"
 	"github.com/netbirdio/netbird/management/server/activity"
-	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/management/server/affectedpeers"
+	"github.com/netbirdio/netbird/management/server/permissions/modules"
+	"github.com/netbirdio/netbird/management/server/permissions/operations"
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/types"
+	"github.com/netbirdio/netbird/management/server/util"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
-const defaultTTL = 300
-
-type lookupMap map[string]struct{}
-
-// DNSSettings defines dns settings at the account level
-type DNSSettings struct {
-	// DisabledManagementGroups groups whose DNS management is disabled
-	DisabledManagementGroups []string `gorm:"serializer:json"`
-}
-
-// Copy returns a copy of the DNS settings
-func (d DNSSettings) Copy() DNSSettings {
-	settings := DNSSettings{
-		DisabledManagementGroups: make([]string, len(d.DisabledManagementGroups)),
-	}
-	copy(settings.DisabledManagementGroups, d.DisabledManagementGroups)
-	return settings
-}
+const (
+	dnsForwarderPort = nbdns.ForwarderServerPort
+)
 
 // GetDNSSettings validates a user role and returns the DNS settings for the provided account ID
-func (am *DefaultAccountManager) GetDNSSettings(ctx context.Context, accountID string, userID string) (*DNSSettings, error) {
-	unlock := am.Store.AcquireAccountWriteLock(ctx, accountID)
-	defer unlock()
-
-	account, err := am.Store.GetAccount(ctx, accountID)
+func (am *DefaultAccountManager) GetDNSSettings(ctx context.Context, accountID string, userID string) (*types.DNSSettings, error) {
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Dns, operations.Read)
 	if err != nil {
-		return nil, err
+		return nil, status.NewPermissionValidationError(err)
+	}
+	if !allowed {
+		return nil, status.NewPermissionDeniedError()
 	}
 
-	user, err := account.FindUser(userID)
-	if err != nil {
-		return nil, err
-	}
-
-	if !(user.HasAdminPower() || user.IsServiceUser) {
-		return nil, status.Errorf(status.PermissionDenied, "only users with admin power are allowed to view DNS settings")
-	}
-	dnsSettings := account.DNSSettings.Copy()
-	return &dnsSettings, nil
+	return am.Store.GetAccountDNSSettings(ctx, store.LockingStrengthNone, accountID)
 }
 
 // SaveDNSSettings validates a user role and updates the account's DNS settings
-func (am *DefaultAccountManager) SaveDNSSettings(ctx context.Context, accountID string, userID string, dnsSettingsToSave *DNSSettings) error {
-	unlock := am.Store.AcquireAccountWriteLock(ctx, accountID)
-	defer unlock()
-
-	account, err := am.Store.GetAccount(ctx, accountID)
-	if err != nil {
-		return err
-	}
-
-	user, err := account.FindUser(userID)
-	if err != nil {
-		return err
-	}
-
-	if !user.HasAdminPower() {
-		return status.Errorf(status.PermissionDenied, "only users with admin power are allowed to update DNS settings")
-	}
-
+func (am *DefaultAccountManager) SaveDNSSettings(ctx context.Context, accountID string, userID string, dnsSettingsToSave *types.DNSSettings) error {
 	if dnsSettingsToSave == nil {
 		return status.Errorf(status.InvalidArgument, "the dns settings provided are nil")
 	}
 
-	if len(dnsSettingsToSave.DisabledManagementGroups) != 0 {
-		err = validateGroups(dnsSettingsToSave.DisabledManagementGroups, account.Groups)
+	allowed, ctx, err := am.permissionsManager.ValidateUserPermissions(ctx, accountID, userID, modules.Dns, operations.Update)
+	if err != nil {
+		return status.NewPermissionValidationError(err)
+	}
+	if !allowed {
+		return status.NewPermissionDeniedError()
+	}
+
+	var eventsToStore []func()
+	var snap *affectedpeers.Snapshot
+	var change affectedpeers.Change
+
+	err = am.Store.ExecuteInTransaction(ctx, func(transaction store.Store) error {
+		if err = validateDNSSettings(ctx, transaction, accountID, dnsSettingsToSave); err != nil {
+			return err
+		}
+
+		oldSettings, err := transaction.GetAccountDNSSettings(ctx, store.LockingStrengthUpdate, accountID)
 		if err != nil {
 			return err
 		}
-	}
 
-	oldSettings := account.DNSSettings.Copy()
-	account.DNSSettings = dnsSettingsToSave.Copy()
+		addedGroups := util.Difference(dnsSettingsToSave.DisabledManagementGroups, oldSettings.DisabledManagementGroups)
+		removedGroups := util.Difference(oldSettings.DisabledManagementGroups, dnsSettingsToSave.DisabledManagementGroups)
 
-	account.Network.IncSerial()
-	if err = am.Store.SaveAccount(ctx, account); err != nil {
+		events := am.prepareDNSSettingsEvents(ctx, transaction, accountID, userID, addedGroups, removedGroups)
+		eventsToStore = append(eventsToStore, events...)
+
+		if err = transaction.SaveDNSSettings(ctx, accountID, dnsSettingsToSave); err != nil {
+			return err
+		}
+
+		change = affectedpeers.Change{DistributionGroupIDs: slices.Concat(addedGroups, removedGroups)}
+		if snap, err = affectedpeers.Load(ctx, transaction, accountID, change); err != nil {
+			return err
+		}
+
+		return transaction.IncrementNetworkSerial(ctx, accountID)
+	})
+	if err != nil {
 		return err
 	}
 
-	addedGroups := difference(dnsSettingsToSave.DisabledManagementGroups, oldSettings.DisabledManagementGroups)
-	for _, id := range addedGroups {
-		group := account.GetGroup(id)
-		meta := map[string]any{"group": group.Name, "group_id": group.ID}
-		am.StoreEvent(ctx, userID, accountID, accountID, activity.GroupAddedToDisabledManagementGroups, meta)
+	for _, storeEvent := range eventsToStore {
+		storeEvent()
 	}
 
-	removedGroups := difference(oldSettings.DisabledManagementGroups, dnsSettingsToSave.DisabledManagementGroups)
-	for _, id := range removedGroups {
-		group := account.GetGroup(id)
-		meta := map[string]any{"group": group.Name, "group_id": group.ID}
-		am.StoreEvent(ctx, userID, accountID, accountID, activity.GroupRemovedFromDisabledManagementGroups, meta)
-	}
-
-	am.updateAccountPeers(ctx, account)
+	am.ExpandAndUpdateAffected(ctx, accountID, snap, change)
 
 	return nil
 }
 
-func toProtocolDNSConfig(update nbdns.Config) *proto.DNSConfig {
-	protoUpdate := &proto.DNSConfig{ServiceEnable: update.ServiceEnable}
+// prepareDNSSettingsEvents prepares a list of event functions to be stored.
+func (am *DefaultAccountManager) prepareDNSSettingsEvents(ctx context.Context, transaction store.Store, accountID, userID string, addedGroups, removedGroups []string) []func() {
+	var eventsToStore []func()
 
-	for _, zone := range update.CustomZones {
-		protoZone := &proto.CustomZone{Domain: zone.Domain}
-		for _, record := range zone.Records {
-			protoZone.Records = append(protoZone.Records, &proto.SimpleRecord{
-				Name:  record.Name,
-				Type:  int64(record.Type),
-				Class: record.Class,
-				TTL:   int64(record.TTL),
-				RData: record.RData,
-			})
-		}
-		protoUpdate.CustomZones = append(protoUpdate.CustomZones, protoZone)
+	modifiedGroups := slices.Concat(addedGroups, removedGroups)
+	groups, err := transaction.GetGroupsByIDs(ctx, store.LockingStrengthNone, accountID, modifiedGroups)
+	if err != nil {
+		log.WithContext(ctx).Debugf("failed to get groups for dns settings events: %v", err)
+		return nil
 	}
 
-	for _, nsGroup := range update.NameServerGroups {
-		protoGroup := &proto.NameServerGroup{
-			Primary:              nsGroup.Primary,
-			Domains:              nsGroup.Domains,
-			SearchDomainsEnabled: nsGroup.SearchDomainsEnabled,
-		}
-		for _, ns := range nsGroup.NameServers {
-			protoNS := &proto.NameServer{
-				IP:     ns.IP.String(),
-				Port:   int64(ns.Port),
-				NSType: int64(ns.NSType),
-			}
-			protoGroup.NameServers = append(protoGroup.NameServers, protoNS)
-		}
-		protoUpdate.NameServerGroups = append(protoUpdate.NameServerGroups, protoGroup)
-	}
-
-	return protoUpdate
-}
-
-func getPeersCustomZone(ctx context.Context, account *Account, dnsDomain string) nbdns.CustomZone {
-	if dnsDomain == "" {
-		log.WithContext(ctx).Errorf("no dns domain is set, returning empty zone")
-		return nbdns.CustomZone{}
-	}
-
-	customZone := nbdns.CustomZone{
-		Domain: dns.Fqdn(dnsDomain),
-	}
-
-	for _, peer := range account.Peers {
-		if peer.DNSLabel == "" {
-			log.WithContext(ctx).Errorf("found a peer with empty dns label. It was probably caused by a invalid character in its name. Peer Name: %s", peer.Name)
+	for _, groupID := range addedGroups {
+		group, ok := groups[groupID]
+		if !ok {
+			log.WithContext(ctx).Debugf("skipped adding group: %s GroupAddedToDisabledManagementGroups activity", groupID)
 			continue
 		}
 
-		customZone.Records = append(customZone.Records, nbdns.SimpleRecord{
-			Name:  dns.Fqdn(peer.DNSLabel + "." + dnsDomain),
-			Type:  int(dns.TypeA),
-			Class: nbdns.DefaultClass,
-			TTL:   defaultTTL,
-			RData: peer.IP.String(),
+		eventsToStore = append(eventsToStore, func() {
+			meta := map[string]any{"group": group.Name, "group_id": group.ID}
+			am.StoreEvent(ctx, userID, accountID, accountID, activity.GroupAddedToDisabledManagementGroups, meta)
+		})
+
+	}
+
+	for _, groupID := range removedGroups {
+		group, ok := groups[groupID]
+		if !ok {
+			log.WithContext(ctx).Debugf("skipped adding group: %s GroupRemovedFromDisabledManagementGroups activity", groupID)
+			continue
+		}
+
+		eventsToStore = append(eventsToStore, func() {
+			meta := map[string]any{"group": group.Name, "group_id": group.ID}
+			am.StoreEvent(ctx, userID, accountID, accountID, activity.GroupRemovedFromDisabledManagementGroups, meta)
 		})
 	}
 
-	return customZone
+	return eventsToStore
 }
 
-func getPeerNSGroups(account *Account, peerID string) []*nbdns.NameServerGroup {
-	groupList := account.getPeerGroups(peerID)
-
-	var peerNSGroups []*nbdns.NameServerGroup
-
-	for _, nsGroup := range account.NameServerGroups {
-		if !nsGroup.Enabled {
-			continue
-		}
-		for _, gID := range nsGroup.Groups {
-			_, found := groupList[gID]
-			if found {
-				if !peerIsNameserver(account.GetPeer(peerID), nsGroup) {
-					peerNSGroups = append(peerNSGroups, nsGroup.Copy())
-					break
-				}
-			}
-		}
+// validateDNSSettings validates the DNS settings.
+func validateDNSSettings(ctx context.Context, transaction store.Store, accountID string, settings *types.DNSSettings) error {
+	if len(settings.DisabledManagementGroups) == 0 {
+		return nil
 	}
 
-	return peerNSGroups
-}
-
-// peerIsNameserver returns true if the peer is a nameserver for a nsGroup
-func peerIsNameserver(peer *nbpeer.Peer, nsGroup *nbdns.NameServerGroup) bool {
-	for _, ns := range nsGroup.NameServers {
-		if peer.IP.Equal(ns.IP.AsSlice()) {
-			return true
-		}
-	}
-	return false
-}
-
-func addPeerLabelsToAccount(ctx context.Context, account *Account, peerLabels lookupMap) {
-	for _, peer := range account.Peers {
-		label, err := getPeerHostLabel(peer.Name, peerLabels)
-		if err != nil {
-			log.WithContext(ctx).Errorf("got an error while generating a peer host label. Peer name %s, error: %v. Trying with the peer's meta hostname", peer.Name, err)
-			label, err = getPeerHostLabel(peer.Meta.Hostname, peerLabels)
-			if err != nil {
-				log.WithContext(ctx).Errorf("got another error while generating a peer host label with hostname. Peer hostname %s, error: %v. Skipping", peer.Meta.Hostname, err)
-				continue
-			}
-		}
-		peer.DNSLabel = label
-		peerLabels[label] = struct{}{}
-	}
-}
-
-func getPeerHostLabel(name string, peerLabels lookupMap) (string, error) {
-	label, err := nbdns.GetParsedDomainLabel(name)
+	groups, err := transaction.GetGroupsByIDs(ctx, store.LockingStrengthNone, accountID, settings.DisabledManagementGroups)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	uniqueLabel := getUniqueHostLabel(label, peerLabels)
-	if uniqueLabel == "" {
-		return "", fmt.Errorf("couldn't find a unique valid label for %s, parsed label %s", name, label)
-	}
-	return uniqueLabel, nil
-}
-
-// getUniqueHostLabel look for a unique host label, and if doesn't find add a suffix up to 999
-func getUniqueHostLabel(name string, peerLabels lookupMap) string {
-	_, found := peerLabels[name]
-	if !found {
-		return name
-	}
-	for i := 1; i < 1000; i++ {
-		nameWithSuffix := name + "-" + strconv.Itoa(i)
-		_, found = peerLabels[nameWithSuffix]
-		if !found {
-			return nameWithSuffix
-		}
-	}
-	return ""
+	return validateGroups(settings.DisabledManagementGroups, groups)
 }

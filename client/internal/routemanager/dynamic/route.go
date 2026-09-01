@@ -14,10 +14,12 @@ import (
 
 	nberrors "github.com/netbirdio/netbird/client/errors"
 	"github.com/netbirdio/netbird/client/internal/peer"
+	"github.com/netbirdio/netbird/client/internal/routemanager/common"
+	"github.com/netbirdio/netbird/client/internal/routemanager/iface"
 	"github.com/netbirdio/netbird/client/internal/routemanager/refcounter"
 	"github.com/netbirdio/netbird/client/internal/routemanager/util"
-	"github.com/netbirdio/netbird/management/domain"
 	"github.com/netbirdio/netbird/route"
+	"github.com/netbirdio/netbird/shared/management/domain"
 )
 
 const (
@@ -47,31 +49,25 @@ type Route struct {
 	currentPeerKey       string
 	cancel               context.CancelFunc
 	statusRecorder       *peer.Status
+	wgInterface          iface.WGIface
+	resolverAddr         netip.AddrPort
 }
 
-func NewRoute(
-	rt *route.Route,
-	routeRefCounter *refcounter.RouteRefCounter,
-	allowedIPsRefCounter *refcounter.AllowedIPsRefCounter,
-	interval time.Duration,
-	statusRecorder *peer.Status,
-) *Route {
+func NewRoute(params common.HandlerParams, resolverAddr netip.AddrPort) *Route {
 	return &Route{
-		route:                rt,
-		routeRefCounter:      routeRefCounter,
-		allowedIPsRefcounter: allowedIPsRefCounter,
-		interval:             interval,
+		route:                params.Route,
+		routeRefCounter:      params.RouteRefCounter,
+		allowedIPsRefcounter: params.AllowedIPsRefCounter,
+		interval:             params.DnsRouterInterval,
+		statusRecorder:       params.StatusRecorder,
+		wgInterface:          params.WgInterface,
+		resolverAddr:         resolverAddr,
 		dynamicDomains:       domainMap{},
-		statusRecorder:       statusRecorder,
 	}
 }
 
 func (r *Route) String() string {
-	s, err := r.route.Domains.String()
-	if err != nil {
-		return r.route.Domains.PunycodeString()
-	}
-	return s
+	return r.route.Domains.SafeString()
 }
 
 func (r *Route) AddRoute(ctx context.Context) error {
@@ -139,7 +135,7 @@ func (r *Route) RemoveAllowedIPs() error {
 	var merr *multierror.Error
 	for _, domainPrefixes := range r.dynamicDomains {
 		for _, prefix := range domainPrefixes {
-			if _, err := r.allowedIPsRefcounter.Decrement(prefix); err != nil {
+			if _, err := r.allowedIPsRefcounter.Decrement(prefix, r.currentPeerKey); err != nil {
 				merr = multierror.Append(merr, fmt.Errorf("remove allowed IP %s: %w", prefix, err))
 			}
 		}
@@ -189,18 +185,23 @@ func (r *Route) startResolver(ctx context.Context) {
 }
 
 func (r *Route) update(ctx context.Context) error {
-	if resolved, err := r.resolveDomains(); err != nil {
-		return fmt.Errorf("resolve domains: %w", err)
-	} else if err := r.updateDynamicRoutes(ctx, resolved); err != nil {
+	resolved, err := r.resolveDomains(ctx)
+	if err != nil {
+		if len(resolved) == 0 {
+			return fmt.Errorf("resolve domains: %w", err)
+		}
+		log.Warnf("Failed to resolve domains: %v", err)
+	}
+	if err := r.updateDynamicRoutes(ctx, resolved); err != nil {
 		return fmt.Errorf("update dynamic routes: %w", err)
 	}
 
 	return nil
 }
 
-func (r *Route) resolveDomains() (domainMap, error) {
+func (r *Route) resolveDomains(ctx context.Context) (domainMap, error) {
 	results := make(chan resolveResult)
-	go r.resolve(results)
+	go r.resolve(ctx, results)
 
 	resolved := domainMap{}
 	var merr *multierror.Error
@@ -216,18 +217,24 @@ func (r *Route) resolveDomains() (domainMap, error) {
 	return resolved, nberrors.FormatErrorOrNil(merr)
 }
 
-func (r *Route) resolve(results chan resolveResult) {
+func (r *Route) resolve(ctx context.Context, results chan resolveResult) {
 	var wg sync.WaitGroup
 
 	for _, d := range r.route.Domains {
 		wg.Add(1)
 		go func(domain domain.Domain) {
 			defer wg.Done()
-			ips, err := net.LookupIP(string(domain))
+
+			ips, err := r.getIPsFromResolver(ctx, domain)
 			if err != nil {
-				results <- resolveResult{domain: domain, err: fmt.Errorf("resolve d %s: %w", domain.SafeString(), err)}
-				return
+				log.Tracef("Failed to resolve domain %s with private resolver: %v", domain.SafeString(), err)
+				ips, err = lookupHostIPs(ctx, domain)
+				if err != nil {
+					results <- resolveResult{domain: domain, err: fmt.Errorf("resolve d %s: %w", domain.SafeString(), err)}
+					return
+				}
 			}
+
 			for _, ip := range ips {
 				prefix, err := util.GetPrefixFromIP(ip)
 				if err != nil {
@@ -274,7 +281,7 @@ func (r *Route) updateDynamicRoutes(ctx context.Context, newDomains domainMap) e
 		updatedPrefixes := combinePrefixes(oldPrefixes, removedPrefixes, addedPrefixes)
 		r.dynamicDomains[domain] = updatedPrefixes
 
-		r.statusRecorder.UpdateResolvedDomainsStates(domain, updatedPrefixes)
+		r.statusRecorder.UpdateResolvedDomainsStates(domain, domain, updatedPrefixes, r.route.GetResourceID())
 	}
 
 	return nberrors.FormatErrorOrNil(merr)
@@ -285,7 +292,7 @@ func (r *Route) addRoutes(domain domain.Domain, prefixes []netip.Prefix) ([]neti
 	var merr *multierror.Error
 
 	for _, prefix := range prefixes {
-		if _, err := r.routeRefCounter.Increment(prefix, nil); err != nil {
+		if _, err := r.routeRefCounter.Increment(prefix, struct{}{}); err != nil {
 			merr = multierror.Append(merr, fmt.Errorf("add dynamic route for IP %s: %w", prefix, err))
 			continue
 		}
@@ -313,7 +320,7 @@ func (r *Route) removeRoutes(prefixes []netip.Prefix) ([]netip.Prefix, error) {
 			merr = multierror.Append(merr, fmt.Errorf("remove dynamic route for IP %s: %w", prefix, err))
 		}
 		if r.currentPeerKey != "" {
-			if _, err := r.allowedIPsRefcounter.Decrement(prefix); err != nil {
+			if _, err := r.allowedIPsRefcounter.Decrement(prefix, r.currentPeerKey); err != nil {
 				merr = multierror.Append(merr, fmt.Errorf("remove allowed IP %s: %w", prefix, err))
 			}
 		}
@@ -355,6 +362,20 @@ func determinePrefixChanges(oldPrefixes, newPrefixes []netip.Prefix) (toAdd, toR
 		}
 	}
 	return
+}
+
+// lookupHostIPs resolves d via the system resolver, honoring ctx cancellation.
+func lookupHostIPs(ctx context.Context, d domain.Domain) ([]net.IP, error) {
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, d.PunycodeString())
+	if err != nil {
+		return nil, err
+	}
+
+	ips := make([]net.IP, 0, len(addrs))
+	for _, addr := range addrs {
+		ips = append(ips, addr.IP)
+	}
+	return ips, nil
 }
 
 func combinePrefixes(oldPrefixes, removedPrefixes, addedPrefixes []netip.Prefix) []netip.Prefix {

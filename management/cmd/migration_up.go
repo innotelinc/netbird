@@ -8,8 +8,8 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
-	"github.com/netbirdio/netbird/formatter"
-	"github.com/netbirdio/netbird/management/server"
+	"github.com/netbirdio/netbird/formatter/hook"
+	"github.com/netbirdio/netbird/management/server/store"
 	"github.com/netbirdio/netbird/util"
 )
 
@@ -30,9 +30,9 @@ var upCmd = &cobra.Command{
 		}
 
 		//nolint
-		ctx := context.WithValue(cmd.Context(), formatter.ExecutionContextKey, formatter.SystemSource)
+		ctx := context.WithValue(cmd.Context(), hook.ExecutionContextKey, hook.SystemSource)
 
-		if err := server.MigrateFileStoreToSqlite(ctx, mgmtDataDir); err != nil {
+		if err := store.MigrateFileStoreToSqlite(ctx, mgmtDataDir); err != nil {
 			return err
 		}
 		log.WithContext(ctx).Info("Migration finished successfully")

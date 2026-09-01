@@ -1,97 +1,120 @@
 package iptables
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"net"
-	"strconv"
+	"slices"
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/google/uuid"
-	"github.com/nadoo/ipset"
+	ipset "github.com/lrh3321/ipset-go"
 	log "github.com/sirupsen/logrus"
 
 	firewall "github.com/netbirdio/netbird/client/firewall/manager"
+	"github.com/netbirdio/netbird/client/internal/statemanager"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
 const (
 	tableName = "filter"
 
 	// rules chains contains the effective ACL rules
-	chainNameInputRules  = "NETBIRD-ACL-INPUT"
-	chainNameOutputRules = "NETBIRD-ACL-OUTPUT"
+	chainNameInputRules = "NETBIRD-ACL-INPUT"
 
-	postRoutingMark = "0x000007e4"
+	// mangleFwdKey is the entries map key for mangle FORWARD guard rules that prevent
+	// external DNAT from bypassing ACL rules.
+	mangleFwdKey = "MANGLE-FORWARD"
 )
 
-type aclManager struct {
-	iptablesClient      *iptables.IPTables
-	wgIface             iFaceMapper
-	routeingFwChainName string
+type aclEntries map[string][][]string
 
-	entries    map[string][][]string
-	ipsetStore *ipsetStore
+type entry struct {
+	spec     []string
+	position int
 }
 
-func newAclManager(iptablesClient *iptables.IPTables, wgIface iFaceMapper, routeingFwChainName string) (*aclManager, error) {
-	m := &aclManager{
-		iptablesClient:      iptablesClient,
-		wgIface:             wgIface,
-		routeingFwChainName: routeingFwChainName,
+type aclManager struct {
+	iptablesClient  *iptables.IPTables
+	wgIface         iFaceMapper
+	entries         aclEntries
+	optionalEntries map[string][]entry
+	ipsetStore      *ipsetStore
+	v6              bool
+	ipsetSupported  bool
 
-		entries:    make(map[string][][]string),
-		ipsetStore: newIpsetStore(),
-	}
+	stateManager *statemanager.Manager
+}
 
-	err := ipset.Init()
-	if err != nil {
-		return nil, fmt.Errorf("failed to init ipset: %w", err)
-	}
+func newAclManager(iptablesClient *iptables.IPTables, wgIface iFaceMapper) (*aclManager, error) {
+	return &aclManager{
+		iptablesClient:  iptablesClient,
+		wgIface:         wgIface,
+		entries:         make(map[string][][]string),
+		optionalEntries: make(map[string][]entry),
+		ipsetStore:      newIpsetStore(),
+		v6:              iptablesClient.Proto() == iptables.ProtocolIPv6,
+	}, nil
+}
+
+func (m *aclManager) init(stateManager *statemanager.Manager) error {
+	m.stateManager = stateManager
+
+	m.ipsetSupported = m.probeIPSetSupport()
 
 	m.seedInitialEntries()
+	m.seedInitialOptionalEntries()
 
-	err = m.cleanChains()
-	if err != nil {
-		return nil, err
+	if err := m.cleanChains(); err != nil {
+		return fmt.Errorf("clean chains: %w", err)
 	}
 
-	err = m.createDefaultChains()
-	if err != nil {
-		return nil, err
+	if err := m.createDefaultChains(); err != nil {
+		return fmt.Errorf("create default chains: %w", err)
 	}
-	return m, nil
+
+	m.updateState()
+
+	return nil
 }
 
-func (m *aclManager) AddFiltering(
+func (m *aclManager) AddPeerFiltering(
+	id []byte,
 	ip net.IP,
 	protocol firewall.Protocol,
 	sPort *firewall.Port,
 	dPort *firewall.Port,
-	direction firewall.RuleDirection,
 	action firewall.Action,
 	ipsetName string,
 ) ([]firewall.Rule, error) {
-	var dPortVal, sPortVal string
-	if dPort != nil && dPort.Values != nil {
-		// TODO: we support only one port per rule in current implementation of ACLs
-		dPortVal = strconv.Itoa(dPort.Values[0])
-	}
-	if sPort != nil && sPort.Values != nil {
-		sPortVal = strconv.Itoa(sPort.Values[0])
-	}
+	chain := chainNameInputRules
 
-	var chain string
-	if direction == firewall.RuleDirectionOUT {
-		chain = chainNameOutputRules
-	} else {
-		chain = chainNameInputRules
+	ipsetName = transformIPsetName(ipsetName, sPort, dPort, action)
+	if m.v6 && ipsetName != "" {
+		ipsetName += "-v6"
 	}
+	// When the kernel lacks the required ipset hash module, fall back to
+	// per-IP iptables rules (pre-0.68 behavior) so ACLs keep working instead
+	// of silently leaving the chain empty.
+	if ipsetName != "" && !m.ipsetSupported {
+		ipsetName = ""
+	}
+	proto := protoForFamily(protocol, m.v6)
+	specs := filterRuleSpecs(ip, proto, sPort, dPort, action, ipsetName)
 
-	ipsetName = transformIPsetName(ipsetName, sPortVal, dPortVal)
-	specs := filterRuleSpecs(ip, string(protocol), sPortVal, dPortVal, direction, action, ipsetName)
+	mangleSpecs := slices.Clone(specs)
+	mangleSpecs = append(mangleSpecs,
+		"-i", m.wgIface.Name(),
+		"-m", "addrtype", "--dst-type", "LOCAL",
+		"-j", "MARK", "--set-xmark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected),
+	)
+
+	specs = append(specs, "-j", actionToStr(action))
 	if ipsetName != "" {
 		if ipList, ipsetExists := m.ipsetStore.ipset(ipsetName); ipsetExists {
-			if err := ipset.Add(ipsetName, ip.String()); err != nil {
-				return nil, fmt.Errorf("failed to add IP to ipset: %w", err)
+			if err := m.addToIPSet(ipsetName, ip); err != nil {
+				return nil, fmt.Errorf("add IP to ipset: %w", err)
 			}
 			// if ruleset already exists it means we already have the firewall rule
 			// so we need to update IPs in the ruleset and return new fw.Rule object for ACL manager.
@@ -102,24 +125,29 @@ func (m *aclManager) AddFiltering(
 				ip:        ip.String(),
 				chain:     chain,
 				specs:     specs,
+				v6:        m.v6,
 			}}, nil
 		}
 
-		if err := ipset.Flush(ipsetName); err != nil {
-			log.Errorf("flush ipset %s before use it: %s", ipsetName, err)
+		if err := m.flushIPSet(ipsetName); err != nil {
+			if errors.Is(err, ipset.ErrSetNotExist) {
+				log.Debugf("flush ipset %s before use: %v", ipsetName, err)
+			} else {
+				log.Errorf("flush ipset %s before use: %v", ipsetName, err)
+			}
 		}
-		if err := ipset.Create(ipsetName); err != nil {
-			return nil, fmt.Errorf("failed to create ipset: %w", err)
+		if err := m.createIPSet(ipsetName); err != nil {
+			return nil, fmt.Errorf("create ipset: %w", err)
 		}
-		if err := ipset.Add(ipsetName, ip.String()); err != nil {
-			return nil, fmt.Errorf("failed to add IP to ipset: %w", err)
+		if err := m.addToIPSet(ipsetName, ip); err != nil {
+			return nil, fmt.Errorf("add IP to ipset: %w", err)
 		}
 
 		ipList := newIpList(ip.String())
 		m.ipsetStore.addIpList(ipsetName, ipList)
 	}
 
-	ok, err := m.iptablesClient.Exists("filter", chain, specs...)
+	ok, err := m.iptablesClient.Exists(tableFilter, chain, specs...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to check rule: %w", err)
 	}
@@ -127,45 +155,54 @@ func (m *aclManager) AddFiltering(
 		return nil, fmt.Errorf("rule already exists")
 	}
 
-	if err := m.iptablesClient.Insert("filter", chain, 1, specs...); err != nil {
+	// Insert DROP rules at the beginning, append ACCEPT rules at the end
+	if action == firewall.ActionDrop {
+		// Insert at the beginning of the chain (position 1)
+		err = m.iptablesClient.Insert(tableFilter, chain, 1, specs...)
+	} else {
+		err = m.iptablesClient.Append(tableFilter, chain, specs...)
+	}
+	if err != nil {
 		return nil, err
 	}
 
+	if err := m.iptablesClient.Append(tableMangle, chainRTPRE, mangleSpecs...); err != nil {
+		log.Errorf("failed to add mangle rule: %v", err)
+		mangleSpecs = nil
+	}
+
 	rule := &Rule{
-		ruleID:    uuid.New().String(),
-		specs:     specs,
-		ipsetName: ipsetName,
-		ip:        ip.String(),
-		chain:     chain,
+		ruleID:      uuid.New().String(),
+		specs:       specs,
+		mangleSpecs: mangleSpecs,
+		ipsetName:   ipsetName,
+		ip:          ip.String(),
+		chain:       chain,
+		v6:          m.v6,
 	}
 
-	if !shouldAddToPrerouting(protocol, dPort, direction) {
-		return []firewall.Rule{rule}, nil
-	}
+	m.updateState()
 
-	rulePrerouting, err := m.addPreroutingFilter(ipsetName, string(protocol), dPortVal, ip)
-	if err != nil {
-		return []firewall.Rule{rule}, err
-	}
-	return []firewall.Rule{rule, rulePrerouting}, nil
+	return []firewall.Rule{rule}, nil
 }
 
-// DeleteRule from the firewall by rule definition
-func (m *aclManager) DeleteRule(rule firewall.Rule) error {
+// DeletePeerRule from the firewall by rule definition
+func (m *aclManager) DeletePeerRule(rule firewall.Rule) error {
 	r, ok := rule.(*Rule)
 	if !ok {
 		return fmt.Errorf("invalid rule type")
 	}
 
-	if r.chain == "PREROUTING" {
-		goto DELETERULE
-	}
-
+	shouldDestroyIpset := false
 	if ipsetList, ok := m.ipsetStore.ipset(r.ipsetName); ok {
 		// delete IP from ruleset IPs list and ipset
 		if _, ok := ipsetList.ips[r.ip]; ok {
-			if err := ipset.Del(r.ipsetName, r.ip); err != nil {
-				return fmt.Errorf("failed to delete ip from ipset: %w", err)
+			ip := net.ParseIP(r.ip)
+			if ip == nil {
+				return fmt.Errorf("parse IP %s", r.ip)
+			}
+			if err := m.delFromIPSet(r.ipsetName, ip); err != nil {
+				return fmt.Errorf("delete ip from ipset: %w", err)
 			}
 			delete(ipsetList.ips, r.ip)
 		}
@@ -179,92 +216,47 @@ func (m *aclManager) DeleteRule(rule firewall.Rule) error {
 		// we delete last IP from the set, that means we need to delete
 		// set itself and associated firewall rule too
 		m.ipsetStore.deleteIpset(r.ipsetName)
+		shouldDestroyIpset = true
+	}
 
-		if err := ipset.Destroy(r.ipsetName); err != nil {
-			log.Errorf("delete empty ipset: %v", err)
+	if err := m.iptablesClient.Delete(tableName, r.chain, r.specs...); err != nil {
+		return fmt.Errorf("failed to delete rule: %s, %v: %w", r.chain, r.specs, err)
+	}
+
+	if r.mangleSpecs != nil {
+		if err := m.iptablesClient.Delete(tableMangle, chainRTPRE, r.mangleSpecs...); err != nil {
+			log.Errorf("failed to delete mangle rule: %v", err)
 		}
 	}
 
-DELETERULE:
-	var table string
-	if r.chain == "PREROUTING" {
-		table = "mangle"
-	} else {
-		table = "filter"
+	if shouldDestroyIpset {
+		if err := m.destroyIPSet(r.ipsetName); err != nil {
+			if errors.Is(err, ipset.ErrBusy) || errors.Is(err, ipset.ErrSetNotExist) {
+				log.Debugf("destroy empty ipset: %v", err)
+			} else {
+				log.Errorf("destroy empty ipset: %v", err)
+			}
+		}
 	}
-	err := m.iptablesClient.Delete(table, r.chain, r.specs...)
-	if err != nil {
-		log.Debugf("failed to delete rule, %s, %v: %s", r.chain, r.specs, err)
-	}
-	return err
+
+	m.updateState()
+
+	return nil
 }
 
 func (m *aclManager) Reset() error {
-	return m.cleanChains()
-}
-
-func (m *aclManager) addPreroutingFilter(ipsetName string, protocol string, port string, ip net.IP) (*Rule, error) {
-	var src []string
-	if ipsetName != "" {
-		src = []string{"-m", "set", "--set", ipsetName, "src"}
-	} else {
-		src = []string{"-s", ip.String()}
-	}
-	specs := []string{
-		"-d", m.wgIface.Address().IP.String(),
-		"-p", protocol,
-		"--dport", port,
-		"-j", "MARK", "--set-mark", postRoutingMark,
+	if err := m.cleanChains(); err != nil {
+		return fmt.Errorf("clean chains: %w", err)
 	}
 
-	specs = append(src, specs...)
+	m.updateState()
 
-	ok, err := m.iptablesClient.Exists("mangle", "PREROUTING", specs...)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check rule: %w", err)
-	}
-	if ok {
-		return nil, fmt.Errorf("rule already exists")
-	}
-
-	if err := m.iptablesClient.Insert("mangle", "PREROUTING", 1, specs...); err != nil {
-		return nil, err
-	}
-
-	rule := &Rule{
-		ruleID:    uuid.New().String(),
-		specs:     specs,
-		ipsetName: ipsetName,
-		ip:        ip.String(),
-		chain:     "PREROUTING",
-	}
-	return rule, nil
+	return nil
 }
 
 // todo write less destructive cleanup mechanism
 func (m *aclManager) cleanChains() error {
-	ok, err := m.iptablesClient.ChainExists(tableName, chainNameOutputRules)
-	if err != nil {
-		log.Debugf("failed to list chains: %s", err)
-		return err
-	}
-	if ok {
-		rules := m.entries["OUTPUT"]
-		for _, rule := range rules {
-			err := m.iptablesClient.DeleteIfExists(tableName, "OUTPUT", rule...)
-			if err != nil {
-				log.Errorf("failed to delete rule: %v, %s", rule, err)
-			}
-		}
-
-		err = m.iptablesClient.ClearAndDeleteChain(tableName, chainNameOutputRules)
-		if err != nil {
-			log.Debugf("failed to clear and delete %s chain: %s", chainNameOutputRules, err)
-			return err
-		}
-	}
-
-	ok, err = m.iptablesClient.ChainExists(tableName, chainNameInputRules)
+	ok, err := m.iptablesClient.ChainExists(tableName, chainNameInputRules)
 	if err != nil {
 		log.Debugf("failed to list chains: %s", err)
 		return err
@@ -293,8 +285,7 @@ func (m *aclManager) cleanChains() error {
 
 	ok, err = m.iptablesClient.ChainExists("mangle", "PREROUTING")
 	if err != nil {
-		log.Debugf("failed to list chains: %s", err)
-		return err
+		return fmt.Errorf("list chains: %w", err)
 	}
 	if ok {
 		for _, rule := range m.entries["PREROUTING"] {
@@ -303,19 +294,28 @@ func (m *aclManager) cleanChains() error {
 				log.Errorf("failed to delete rule: %v, %s", rule, err)
 			}
 		}
-		err = m.iptablesClient.ClearChain("mangle", "PREROUTING")
-		if err != nil {
-			log.Debugf("failed to clear %s chain: %s", "PREROUTING", err)
-			return err
+	}
+
+	for _, rule := range m.entries[mangleFwdKey] {
+		if err := m.iptablesClient.DeleteIfExists(tableMangle, chainFORWARD, rule...); err != nil {
+			log.Errorf("failed to delete mangle FORWARD guard rule: %v, %s", rule, err)
 		}
 	}
 
 	for _, ipsetName := range m.ipsetStore.ipsetNames() {
-		if err := ipset.Flush(ipsetName); err != nil {
-			log.Errorf("flush ipset %q during reset: %v", ipsetName, err)
+		if err := m.flushIPSet(ipsetName); err != nil {
+			if errors.Is(err, ipset.ErrSetNotExist) {
+				log.Debugf("flush ipset %q during reset: %v", ipsetName, err)
+			} else {
+				log.Errorf("flush ipset %q during reset: %v", ipsetName, err)
+			}
 		}
-		if err := ipset.Destroy(ipsetName); err != nil {
-			log.Errorf("delete ipset %q during reset: %v", ipsetName, err)
+		if err := m.destroyIPSet(ipsetName); err != nil {
+			if errors.Is(err, ipset.ErrBusy) || errors.Is(err, ipset.ErrSetNotExist) {
+				log.Debugf("destroy ipset %q during reset: %v", ipsetName, err)
+			} else {
+				log.Errorf("destroy ipset %q during reset: %v", ipsetName, err)
+			}
 		}
 		m.ipsetStore.deleteIpset(ipsetName)
 	}
@@ -330,109 +330,152 @@ func (m *aclManager) createDefaultChains() error {
 		return err
 	}
 
-	// chain netbird-acl-output-rules
-	if err := m.iptablesClient.NewChain(tableName, chainNameOutputRules); err != nil {
-		log.Debugf("failed to create '%s' chain: %s", chainNameOutputRules, err)
-		return err
+	for chainName, rules := range m.entries {
+		// mangle FORWARD guard rules are handled separately below
+		if chainName == mangleFwdKey {
+			continue
+		}
+		for _, rule := range rules {
+			if err := m.iptablesClient.InsertUnique(tableName, chainName, 1, rule...); err != nil {
+				log.Debugf("failed to create input chain jump rule: %s", err)
+				return err
+			}
+		}
 	}
 
-	for chainName, rules := range m.entries {
-		for _, rule := range rules {
-			if chainName == "FORWARD" {
-				// position 2 because we add it after router's, jump rule
-				if err := m.iptablesClient.InsertUnique(tableName, "FORWARD", 2, rule...); err != nil {
-					log.Debugf("failed to create input chain jump rule: %s", err)
-					return err
-				}
-			} else {
-				if err := m.iptablesClient.AppendUnique(tableName, chainName, rule...); err != nil {
-					log.Debugf("failed to create input chain jump rule: %s", err)
-					return err
-				}
+	for chainName, entries := range m.optionalEntries {
+		for _, entry := range entries {
+			if err := m.iptablesClient.InsertUnique(tableName, chainName, entry.position, entry.spec...); err != nil {
+				log.Errorf("failed to insert optional entry %v: %v", entry.spec, err)
+				continue
 			}
+			m.entries[chainName] = append(m.entries[chainName], entry.spec)
+		}
+	}
+	clear(m.optionalEntries)
+
+	// Insert mangle FORWARD guard rules to prevent external DNAT bypass.
+	for _, rule := range m.entries[mangleFwdKey] {
+		if err := m.iptablesClient.AppendUnique(tableMangle, chainFORWARD, rule...); err != nil {
+			log.Errorf("failed to add mangle FORWARD guard rule: %v", err)
 		}
 	}
 
 	return nil
 }
 
+// seedInitialEntries adds default rules to the entries map, rules are inserted on pos 1, hence the order is reversed.
+// We want to make sure our traffic is not dropped by existing rules.
+
+// The existing FORWARD rules/policies decide outbound traffic towards our interface.
+// In case the FORWARD policy is set to "drop", we add an established/related rule to allow return traffic for the inbound rule.
 func (m *aclManager) seedInitialEntries() {
-	m.appendToEntries("INPUT",
-		[]string{"-i", m.wgIface.Name(), "!", "-s", m.wgIface.Address().String(), "-d", m.wgIface.Address().String(), "-j", "ACCEPT"})
-
-	m.appendToEntries("INPUT",
-		[]string{"-i", m.wgIface.Name(), "-s", m.wgIface.Address().String(), "!", "-d", m.wgIface.Address().String(), "-j", "ACCEPT"})
-
-	m.appendToEntries("INPUT",
-		[]string{"-i", m.wgIface.Name(), "-s", m.wgIface.Address().String(), "-d", m.wgIface.Address().String(), "-j", chainNameInputRules})
+	established := getConntrackEstablished()
 
 	m.appendToEntries("INPUT", []string{"-i", m.wgIface.Name(), "-j", "DROP"})
+	m.appendToEntries("INPUT", []string{"-i", m.wgIface.Name(), "-j", chainNameInputRules})
+	m.appendToEntries("INPUT", append([]string{"-i", m.wgIface.Name()}, established...))
 
-	m.appendToEntries("OUTPUT",
-		[]string{"-o", m.wgIface.Name(), "!", "-s", m.wgIface.Address().String(), "-d", m.wgIface.Address().String(), "-j", "ACCEPT"})
-
-	m.appendToEntries("OUTPUT",
-		[]string{"-o", m.wgIface.Name(), "-s", m.wgIface.Address().String(), "!", "-d", m.wgIface.Address().String(), "-j", "ACCEPT"})
-
-	m.appendToEntries("OUTPUT",
-		[]string{"-o", m.wgIface.Name(), "-s", m.wgIface.Address().String(), "-d", m.wgIface.Address().String(), "-j", chainNameOutputRules})
-
-	m.appendToEntries("OUTPUT", []string{"-o", m.wgIface.Name(), "-j", "DROP"})
-
+	// Inbound is handled by our ACLs, the rest is dropped.
+	// For outbound we respect the FORWARD policy. However, we need to allow established/related traffic for inbound rules.
 	m.appendToEntries("FORWARD", []string{"-i", m.wgIface.Name(), "-j", "DROP"})
-	m.appendToEntries("FORWARD", []string{"-i", m.wgIface.Name(), "-j", chainNameInputRules})
-	m.appendToEntries("FORWARD",
-		[]string{"-o", m.wgIface.Name(), "-m", "mark", "--mark", postRoutingMark, "-j", "ACCEPT"})
-	m.appendToEntries("FORWARD",
-		[]string{"-i", m.wgIface.Name(), "-m", "mark", "--mark", postRoutingMark, "-j", "ACCEPT"})
-	m.appendToEntries("FORWARD", []string{"-o", m.wgIface.Name(), "-j", m.routeingFwChainName})
-	m.appendToEntries("FORWARD", []string{"-i", m.wgIface.Name(), "-j", m.routeingFwChainName})
 
-	m.appendToEntries("PREROUTING",
-		[]string{"-t", "mangle", "-i", m.wgIface.Name(), "!", "-s", m.wgIface.Address().String(), "-d", m.wgIface.Address().IP.String(), "-m", "mark", "--mark", postRoutingMark})
+	m.appendToEntries("FORWARD", []string{"-o", m.wgIface.Name(), "-j", chainRTFWDOUT})
+	m.appendToEntries("FORWARD", []string{"-i", m.wgIface.Name(), "-j", chainRTFWDIN})
+
+	// Mangle FORWARD guard: when external DNAT redirects traffic from the wg interface, it
+	// traverses FORWARD instead of INPUT, bypassing ACL rules. ACCEPT rules in filter FORWARD
+	// can be inserted above ours. Mangle runs before filter, so these guard rules enforce the
+	// ACL mark check where it cannot be overridden.
+	m.appendToEntries(mangleFwdKey, []string{
+		"-i", m.wgIface.Name(),
+		"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+		"-j", "ACCEPT",
+	})
+	m.appendToEntries(mangleFwdKey, []string{
+		"-i", m.wgIface.Name(),
+		"-m", "conntrack", "--ctstate", "DNAT",
+		"-m", "mark", "!", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected),
+		"-j", "DROP",
+	})
+}
+
+func (m *aclManager) seedInitialOptionalEntries() {
+	m.optionalEntries["FORWARD"] = []entry{
+		{
+			spec:     []string{"-m", "mark", "--mark", fmt.Sprintf("%#x", nbnet.PreroutingFwmarkRedirected), "-j", "ACCEPT"},
+			position: 2,
+		},
+	}
 }
 
 func (m *aclManager) appendToEntries(chainName string, spec []string) {
 	m.entries[chainName] = append(m.entries[chainName], spec)
 }
 
-// filterRuleSpecs returns the specs of a filtering rule
-func filterRuleSpecs(
-	ip net.IP, protocol string, sPort, dPort string, direction firewall.RuleDirection, action firewall.Action, ipsetName string,
-) (specs []string) {
-	matchByIP := true
-	// don't use IP matching if IP is ip 0.0.0.0
-	if ip.String() == "0.0.0.0" {
-		matchByIP = false
+func (m *aclManager) updateState() {
+	if m.stateManager == nil {
+		return
 	}
-	switch direction {
-	case firewall.RuleDirectionIN:
-		if matchByIP {
-			if ipsetName != "" {
-				specs = append(specs, "-m", "set", "--set", ipsetName, "src")
-			} else {
-				specs = append(specs, "-s", ip.String())
-			}
+
+	var currentState *ShutdownState
+	if existing := m.stateManager.GetState(currentState); existing != nil {
+		if existingState, ok := existing.(*ShutdownState); ok {
+			currentState = existingState
 		}
-	case firewall.RuleDirectionOUT:
-		if matchByIP {
-			if ipsetName != "" {
-				specs = append(specs, "-m", "set", "--set", ipsetName, "dst")
-			} else {
-				specs = append(specs, "-d", ip.String())
-			}
+	}
+	if currentState == nil {
+		currentState = &ShutdownState{}
+	}
+
+	currentState.Lock()
+	defer currentState.Unlock()
+
+	// Clone the maps so the persisted state holds a private snapshot. The
+	// live maps keep being mutated by subsequent rule operations while the
+	// state manager marshals the state from its periodic-save goroutine.
+	// Sharing them by reference races the two and aborts the process with a
+	// concurrent map iteration and write.
+	if m.v6 {
+		currentState.ACLEntries6 = maps.Clone(m.entries)
+		currentState.ACLIPsetStore6 = m.ipsetStore.clone()
+	} else {
+		currentState.ACLEntries = maps.Clone(m.entries)
+		currentState.ACLIPsetStore = m.ipsetStore.clone()
+	}
+
+	if err := m.stateManager.UpdateState(currentState); err != nil {
+		log.Errorf("failed to update state: %v", err)
+	}
+}
+
+// filterRuleSpecs returns the specs of a filtering rule
+// protoForFamily translates ICMP to ICMPv6 for ip6tables.
+// ip6tables requires "ipv6-icmp" (or "icmpv6") instead of "icmp".
+func protoForFamily(protocol firewall.Protocol, v6 bool) string {
+	if v6 && protocol == firewall.ProtocolICMP {
+		return "ipv6-icmp"
+	}
+	return string(protocol)
+}
+
+func filterRuleSpecs(ip net.IP, protocol string, sPort, dPort *firewall.Port, action firewall.Action, ipsetName string) (specs []string) {
+	// don't use IP matching if IP is 0.0.0.0
+	matchByIP := !ip.IsUnspecified()
+
+	if matchByIP {
+		if ipsetName != "" {
+			specs = append(specs, "-m", "set", "--match-set", ipsetName, "src")
+		} else {
+			specs = append(specs, "-s", ip.String())
 		}
 	}
 	if protocol != "all" {
 		specs = append(specs, "-p", protocol)
 	}
-	if sPort != "" {
-		specs = append(specs, "--sport", sPort)
-	}
-	if dPort != "" {
-		specs = append(specs, "--dport", dPort)
-	}
-	return append(specs, "-j", actionToStr(action))
+	specs = append(specs, applyPort("--sport", sPort)...)
+	specs = append(specs, applyPort("--dport", dPort)...)
+	return specs
 }
 
 func actionToStr(action firewall.Action) string {
@@ -442,32 +485,119 @@ func actionToStr(action firewall.Action) string {
 	return "DROP"
 }
 
-func transformIPsetName(ipsetName string, sPort, dPort string) string {
-	switch {
-	case ipsetName == "":
+func transformIPsetName(ipsetName string, sPort, dPort *firewall.Port, action firewall.Action) string {
+	if ipsetName == "" {
 		return ""
-	case sPort != "" && dPort != "":
-		return ipsetName + "-sport-dport"
-	case sPort != "":
-		return ipsetName + "-sport"
-	case dPort != "":
-		return ipsetName + "-dport"
+	}
+
+	actionSuffix := ""
+	if action == firewall.ActionDrop {
+		actionSuffix = "-drop"
+	}
+
+	switch {
+	case sPort != nil && dPort != nil:
+		return ipsetName + "-sport-dport" + actionSuffix
+	case sPort != nil:
+		return ipsetName + "-sport" + actionSuffix
+	case dPort != nil:
+		return ipsetName + "-dport" + actionSuffix
 	default:
-		return ipsetName
+		return ipsetName + actionSuffix
 	}
 }
 
-func shouldAddToPrerouting(proto firewall.Protocol, dPort *firewall.Port, direction firewall.RuleDirection) bool {
-	if proto == "all" {
+// probeIPSetSupport checks whether the kernel can create the ipset type used for
+// ACL rules. On kernels lacking the required ipset hash module, ipset creation
+// fails (e.g. "invalid argument"), which would otherwise leave the ACL chain
+// empty and silently drop all policy-permitted inbound traffic. When unsupported,
+// the manager falls back to per-IP iptables rules.
+func (m *aclManager) probeIPSetSupport() bool {
+	// Use a unique name so concurrent processes don't collide and we only ever
+	// destroy the set we created ourselves. ipset names are limited to 31 chars,
+	// so use a short random suffix.
+	probeName := "nb-probe-" + uuid.New().String()[:8]
+
+	opts := ipset.CreateOptions{
+		Replace: true,
+	}
+	if m.v6 {
+		opts.Family = ipset.FamilyIPV6
+	}
+
+	if err := ipset.Create(probeName, ipset.TypeHashNet, opts); err != nil {
+		log.Warnf("ipset is not available (failed to create probe set: %v); "+
+			"falling back to per-IP iptables ACL rules. Ensure the kernel provides "+
+			"the ipset hash:net module (ip_set_hash_net) for better performance with large rule sets", err)
 		return false
 	}
 
-	if direction != firewall.RuleDirectionIN {
-		return false
-	}
+	defer func() {
+		if err := ipset.Destroy(probeName); err != nil {
+			log.Debugf("destroy ipset probe set %q: %v", probeName, err)
+		}
+	}()
 
-	if dPort == nil {
-		return false
-	}
 	return true
+}
+
+func (m *aclManager) createIPSet(name string) error {
+	opts := ipset.CreateOptions{
+		Replace: true,
+	}
+	if m.v6 {
+		opts.Family = ipset.FamilyIPV6
+	}
+
+	if err := ipset.Create(name, ipset.TypeHashNet, opts); err != nil {
+		return fmt.Errorf("create ipset %s: %w", name, err)
+	}
+
+	log.Debugf("created ipset %s with type hash:net", name)
+	return nil
+}
+
+func (m *aclManager) addToIPSet(name string, ip net.IP) error {
+	cidr := uint8(32)
+	if ip.To4() == nil {
+		cidr = 128
+	}
+
+	entry := &ipset.Entry{
+		IP:      ip,
+		CIDR:    cidr,
+		Replace: true,
+	}
+
+	if err := ipset.Add(name, entry); err != nil {
+		return fmt.Errorf("add IP to ipset %s: %w", name, err)
+	}
+
+	return nil
+}
+
+func (m *aclManager) delFromIPSet(name string, ip net.IP) error {
+	cidr := uint8(32)
+	if ip.To4() == nil {
+		cidr = 128
+	}
+
+	entry := &ipset.Entry{
+		IP:   ip,
+		CIDR: cidr,
+	}
+
+	if err := ipset.Del(name, entry); err != nil {
+		return fmt.Errorf("delete IP from ipset %s: %w", name, err)
+	}
+
+	return nil
+}
+
+func (m *aclManager) flushIPSet(name string) error {
+	return ipset.Flush(name)
+}
+
+func (m *aclManager) destroyIPSet(name string) error {
+	return ipset.Destroy(name)
 }

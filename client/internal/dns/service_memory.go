@@ -1,39 +1,46 @@
 package dns
 
 import (
+	"errors"
 	"fmt"
-	"math/big"
-	"net"
+	"net/netip"
 	"sync"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/client/iface"
+	nbnet "github.com/netbirdio/netbird/client/net"
 )
 
-type serviceViaMemory struct {
+type ServiceViaMemory struct {
 	wgInterface       WGIface
 	dnsMux            *dns.ServeMux
-	runtimeIP         string
+	runtimeIP         netip.Addr
 	runtimePort       int
-	udpFilterHookID   string
+	tcpDNS            *tcpDNSServer
+	tcpHookSet        bool
 	listenerIsRunning bool
 	listenerFlagLock  sync.Mutex
 }
 
-func newServiceViaMemory(wgIface WGIface) *serviceViaMemory {
-	s := &serviceViaMemory{
+func NewServiceViaMemory(wgIface WGIface) *ServiceViaMemory {
+	lastIP, err := nbnet.GetLastIPFromNetwork(wgIface.Address().Network, 1)
+	if err != nil {
+		log.Errorf("get last ip from network: %v", err)
+	}
+
+	return &ServiceViaMemory{
 		wgInterface: wgIface,
 		dnsMux:      dns.NewServeMux(),
-
-		runtimeIP:   getLastIPFromNetwork(wgIface.Address().Network, 1),
-		runtimePort: defaultPort,
+		runtimeIP:   lastIP,
+		runtimePort: DefaultPort,
 	}
-	return s
 }
 
-func (s *serviceViaMemory) Listen() error {
+func (s *ServiceViaMemory) Listen() error {
 	s.listenerFlagLock.Lock()
 	defer s.listenerFlagLock.Unlock()
 
@@ -41,10 +48,8 @@ func (s *serviceViaMemory) Listen() error {
 		return nil
 	}
 
-	var err error
-	s.udpFilterHookID, err = s.filterDNSTraffic()
-	if err != nil {
-		return fmt.Errorf("filter dns traffice: %w", err)
+	if err := s.filterDNSTraffic(); err != nil {
+		return fmt.Errorf("filter dns traffic: %w", err)
 	}
 	s.listenerIsRunning = true
 
@@ -52,55 +57,77 @@ func (s *serviceViaMemory) Listen() error {
 	return nil
 }
 
-func (s *serviceViaMemory) Stop() {
+func (s *ServiceViaMemory) Stop() error {
 	s.listenerFlagLock.Lock()
 	defer s.listenerFlagLock.Unlock()
 
 	if !s.listenerIsRunning {
-		return
+		return nil
 	}
 
-	if err := s.wgInterface.GetFilter().RemovePacketHook(s.udpFilterHookID); err != nil {
-		log.Errorf("unable to remove DNS packet hook: %s", err)
+	filter := s.wgInterface.GetFilter()
+	if filter != nil {
+		filter.SetUDPPacketHook(s.runtimeIP, uint16(s.runtimePort), nil)
+		if s.tcpHookSet {
+			filter.SetTCPPacketHook(s.runtimeIP, uint16(s.runtimePort), nil)
+		}
+	}
+
+	if s.tcpDNS != nil {
+		s.tcpDNS.Stop()
 	}
 
 	s.listenerIsRunning = false
+
+	return nil
 }
 
-func (s *serviceViaMemory) RegisterMux(pattern string, handler dns.Handler) {
+func (s *ServiceViaMemory) RegisterMux(pattern string, handler dns.Handler) {
 	s.dnsMux.Handle(pattern, handler)
 }
 
-func (s *serviceViaMemory) DeregisterMux(pattern string) {
+func (s *ServiceViaMemory) DeregisterMux(pattern string) {
 	s.dnsMux.HandleRemove(pattern)
 }
 
-func (s *serviceViaMemory) RuntimePort() int {
+func (s *ServiceViaMemory) RuntimePort() int {
 	return s.runtimePort
 }
 
-func (s *serviceViaMemory) RuntimeIP() string {
+func (s *ServiceViaMemory) RuntimeIP() netip.Addr {
 	return s.runtimeIP
 }
 
-func (s *serviceViaMemory) filterDNSTraffic() (string, error) {
+func (s *ServiceViaMemory) filterDNSTraffic() error {
 	filter := s.wgInterface.GetFilter()
 	if filter == nil {
-		return "", fmt.Errorf("can't set DNS filter, filter not initialized")
+		return errors.New("DNS filter not initialized")
+	}
+
+	// Create TCP DNS server lazily here since the device may not exist at construction time.
+	if s.tcpDNS == nil {
+		if dev := s.wgInterface.GetDevice(); dev != nil {
+			// MTU only affects TCP segment sizing; DNS messages are small so this has no practical impact.
+			s.tcpDNS = newTCPDNSServer(s.dnsMux, dev.Device, s.runtimeIP, uint16(s.runtimePort), iface.DefaultMTU)
+		}
 	}
 
 	firstLayerDecoder := layers.LayerTypeIPv4
-	if s.wgInterface.Address().Network.IP.To4() == nil {
+	if s.wgInterface.Address().IP.Is6() {
 		firstLayerDecoder = layers.LayerTypeIPv6
 	}
 
 	hook := func(packetData []byte) bool {
-		// Decode the packet
 		packet := gopacket.NewPacket(packetData, firstLayerDecoder, gopacket.Default)
 
-		// Get the UDP layer
 		udpLayer := packet.Layer(layers.LayerTypeUDP)
-		udp := udpLayer.(*layers.UDP)
+		if udpLayer == nil {
+			return true
+		}
+		udp, ok := udpLayer.(*layers.UDP)
+		if !ok {
+			return true
+		}
 
 		msg := new(dns.Msg)
 		if err := msg.Unpack(udp.Payload); err != nil {
@@ -108,32 +135,30 @@ func (s *serviceViaMemory) filterDNSTraffic() (string, error) {
 			return true
 		}
 
-		writer := responseWriter{
-			packet: packet,
-			device: s.wgInterface.GetDevice().Device,
+		dev := s.wgInterface.GetDevice()
+		if dev == nil {
+			return true
 		}
-		go s.dnsMux.ServeDNS(&writer, msg)
+
+		writer := &responseWriter{
+			remote: remoteAddrFromPacket(packet),
+			packet: packet,
+			device: dev.Device,
+		}
+		go s.dnsMux.ServeDNS(writer, msg)
 		return true
 	}
 
-	return filter.AddUDPPacketHook(false, net.ParseIP(s.runtimeIP), uint16(s.runtimePort), hook), nil
-}
+	filter.SetUDPPacketHook(s.runtimeIP, uint16(s.runtimePort), hook)
 
-func getLastIPFromNetwork(network *net.IPNet, fromEnd int) string {
-	// Calculate the last IP in the CIDR range
-	var endIP net.IP
-	for i := 0; i < len(network.IP); i++ {
-		endIP = append(endIP, network.IP[i]|^network.Mask[i])
+	if s.tcpDNS != nil {
+		tcpHook := func(packetData []byte) bool {
+			s.tcpDNS.InjectPacket(packetData)
+			return true
+		}
+		filter.SetTCPPacketHook(s.runtimeIP, uint16(s.runtimePort), tcpHook)
+		s.tcpHookSet = true
 	}
 
-	// convert to big.Int
-	endInt := big.NewInt(0)
-	endInt.SetBytes(endIP)
-
-	// subtract fromEnd from the last ip
-	fromEndBig := big.NewInt(int64(fromEnd))
-	resultInt := big.NewInt(0)
-	resultInt.Sub(endInt, fromEndBig)
-
-	return net.IP(resultInt.Bytes()).String()
+	return nil
 }

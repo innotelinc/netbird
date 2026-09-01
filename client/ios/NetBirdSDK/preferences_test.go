@@ -1,21 +1,24 @@
+//go:build ios
+
 package NetBirdSDK
 
 import (
 	"path/filepath"
 	"testing"
 
-	"github.com/netbirdio/netbird/client/internal"
+	"github.com/netbirdio/netbird/client/internal/profilemanager"
 )
 
 func TestPreferences_DefaultValues(t *testing.T) {
 	cfgFile := filepath.Join(t.TempDir(), "netbird.json")
-	p := NewPreferences(cfgFile)
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	p := NewPreferences(cfgFile, stateFile)
 	defaultVar, err := p.GetAdminURL()
 	if err != nil {
 		t.Fatalf("failed to read default value: %s", err)
 	}
 
-	if defaultVar != internal.DefaultAdminURL {
+	if defaultVar != profilemanager.DefaultAdminURL {
 		t.Errorf("invalid default admin url: %s", defaultVar)
 	}
 
@@ -24,7 +27,7 @@ func TestPreferences_DefaultValues(t *testing.T) {
 		t.Fatalf("failed to read default management URL: %s", err)
 	}
 
-	if defaultVar != internal.DefaultManagementURL {
+	if defaultVar != profilemanager.DefaultManagementURL {
 		t.Errorf("invalid default management url: %s", defaultVar)
 	}
 
@@ -42,7 +45,8 @@ func TestPreferences_DefaultValues(t *testing.T) {
 func TestPreferences_ReadUncommitedValues(t *testing.T) {
 	exampleString := "exampleString"
 	cfgFile := filepath.Join(t.TempDir(), "netbird.json")
-	p := NewPreferences(cfgFile)
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	p := NewPreferences(cfgFile, stateFile)
 
 	p.SetAdminURL(exampleString)
 	resp, err := p.GetAdminURL()
@@ -79,7 +83,8 @@ func TestPreferences_Commit(t *testing.T) {
 	exampleURL := "https://myurl.com:443"
 	examplePresharedKey := "topsecret"
 	cfgFile := filepath.Join(t.TempDir(), "netbird.json")
-	p := NewPreferences(cfgFile)
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	p := NewPreferences(cfgFile, stateFile)
 
 	p.SetAdminURL(exampleURL)
 	p.SetManagementURL(exampleURL)
@@ -90,7 +95,7 @@ func TestPreferences_Commit(t *testing.T) {
 		t.Fatalf("failed to save changes: %s", err)
 	}
 
-	p = NewPreferences(cfgFile)
+	p = NewPreferences(cfgFile, stateFile)
 	resp, err := p.GetAdminURL()
 	if err != nil {
 		t.Fatalf("failed to read admin url: %s", err)

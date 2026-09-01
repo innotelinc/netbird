@@ -1,5 +1,4 @@
 //go:build !ios
-// +build !ios
 
 package system
 
@@ -10,15 +9,18 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/netbirdio/netbird/client/system/detect_cloud"
-	"github.com/netbirdio/netbird/client/system/detect_platform"
 	"github.com/netbirdio/netbird/version"
 )
+
+func UpdateStaticInfoAsync() {
+	go updateStaticInfo()
+}
 
 // GetInfo retrieves and parses the system information
 func GetInfo(ctx context.Context) *Info {
@@ -30,7 +32,7 @@ func GetInfo(ctx context.Context) *Info {
 	sysName := string(bytes.Split(utsname.Sysname[:], []byte{0})[0])
 	machine := string(bytes.Split(utsname.Machine[:], []byte{0})[0])
 	release := string(bytes.Split(utsname.Release[:], []byte{0})[0])
-	swVersion, err := exec.Command("sw_vers", "-productVersion").Output()
+	swVersion, err := exec.CommandContext(ctx, "sw_vers", "-productVersion").Output()
 	if err != nil {
 		log.Warnf("got an error while retrieving macOS version with sw_vers, error: %s. Using darwin version instead.\n", err)
 		swVersion = []byte(release)
@@ -41,11 +43,10 @@ func GetInfo(ctx context.Context) *Info {
 		log.Warnf("failed to discover network addresses: %s", err)
 	}
 
-	serialNum, prodName, manufacturer := sysInfo()
-
-	env := Environment{
-		Cloud:    detect_cloud.Detect(ctx),
-		Platform: detect_platform.Detect(ctx),
+	start := time.Now()
+	si := getStaticInfo()
+	if time.Since(start) > 1*time.Second {
+		log.Warnf("updateStaticInfo took %s", time.Since(start))
 	}
 
 	gio := &Info{
@@ -57,15 +58,15 @@ func GetInfo(ctx context.Context) *Info {
 		CPUs:               runtime.NumCPU(),
 		KernelVersion:      release,
 		NetworkAddresses:   addrs,
-		SystemSerialNumber: serialNum,
-		SystemProductName:  prodName,
-		SystemManufacturer: manufacturer,
-		Environment:        env,
+		SystemSerialNumber: si.SystemSerialNumber,
+		SystemProductName:  si.SystemProductName,
+		SystemManufacturer: si.SystemManufacturer,
+		Environment:        si.Environment,
 	}
 
 	systemHostname, _ := os.Hostname()
 	gio.Hostname = extractDeviceName(ctx, systemHostname)
-	gio.WiretrusteeVersion = version.NetbirdVersion()
+	gio.NetbirdVersion = version.NetbirdVersion()
 	gio.UIVersion = extractUserAgent(ctx)
 
 	return gio

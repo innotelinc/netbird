@@ -3,6 +3,7 @@ package idp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,12 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
-
-	"github.com/golang-jwt/jwt"
-	"github.com/stretchr/testify/assert"
 )
 
 type mockHTTPClient struct {
@@ -26,9 +26,11 @@ type mockHTTPClient struct {
 }
 
 func (c *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	body, err := io.ReadAll(req.Body)
-	if err == nil {
-		c.reqBody = string(body)
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err == nil {
+			c.reqBody = string(body)
+		}
 	}
 	return &http.Response{
 		StatusCode: c.code,
@@ -44,14 +46,14 @@ type mockJsonParser struct {
 
 func (m *mockJsonParser) Marshal(v interface{}) ([]byte, error) {
 	if m.marshalErrorString != "" {
-		return nil, fmt.Errorf(m.marshalErrorString)
+		return nil, errors.New(m.marshalErrorString)
 	}
 	return m.jsonParser.Marshal(v)
 }
 
 func (m *mockJsonParser) Unmarshal(data []byte, v interface{}) error {
 	if m.unmarshalErrorString != "" {
-		return fmt.Errorf(m.unmarshalErrorString)
+		return errors.New(m.unmarshalErrorString)
 	}
 	return m.jsonParser.Unmarshal(data, v)
 }

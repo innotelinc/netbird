@@ -7,11 +7,10 @@ import (
 	"regexp"
 
 	"github.com/hashicorp/go-version"
-	"github.com/rs/xid"
 
-	"github.com/netbirdio/netbird/management/server/http/api"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/shared/management/http/api"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 const (
@@ -48,6 +47,8 @@ type Checks struct {
 
 	// AccountID is a reference to the Account that this object belongs
 	AccountID string `json:"-" gorm:"index"`
+
+	PublicID string `json:"-"`
 
 	// Checks is a set of objects that perform the actual checks
 	Checks ChecksDefinition `gorm:"serializer:json"`
@@ -127,6 +128,7 @@ func (pc *Checks) Copy() *Checks {
 		Name:        pc.Name,
 		Description: pc.Description,
 		AccountID:   pc.AccountID,
+		PublicID:    pc.PublicID,
 		Checks:      pc.Checks.Copy(),
 	}
 	return checks
@@ -172,10 +174,6 @@ func NewChecksFromAPIPostureCheckUpdate(source api.PostureCheckUpdate, postureCh
 }
 
 func buildPostureCheck(postureChecksID string, name string, description string, checks api.Checks) (*Checks, error) {
-	if postureChecksID == "" {
-		postureChecksID = xid.New().String()
-	}
-
 	postureChecks := Checks{
 		ID:          postureChecksID,
 		Name:        name,

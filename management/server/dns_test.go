@@ -4,14 +4,31 @@ import (
 	"context"
 	"net/netip"
 	"testing"
+	"time"
+
+	"go.uber.org/mock/gomock"
+	"github.com/stretchr/testify/assert"
+
+	nbdns "github.com/netbirdio/netbird/dns"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/controller"
+	"github.com/netbirdio/netbird/management/internals/controllers/network_map/update_channel"
+	"github.com/netbirdio/netbird/management/internals/modules/peers"
+	ephemeral_manager "github.com/netbirdio/netbird/management/internals/modules/peers/ephemeral/manager"
+	"github.com/netbirdio/netbird/management/internals/server/config"
+	"github.com/netbirdio/netbird/management/server/cache"
+	"github.com/netbirdio/netbird/management/server/integrations/port_forwarding"
+	"github.com/netbirdio/netbird/management/server/job"
+	"github.com/netbirdio/netbird/management/server/permissions"
+	"github.com/netbirdio/netbird/management/server/settings"
+	"github.com/netbirdio/netbird/management/server/store"
+	"github.com/netbirdio/netbird/management/server/telemetry"
+	"github.com/netbirdio/netbird/management/server/types"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/netbirdio/netbird/dns"
 	"github.com/netbirdio/netbird/management/server/activity"
-	"github.com/netbirdio/netbird/management/server/group"
 	nbpeer "github.com/netbirdio/netbird/management/server/peer"
-	"github.com/netbirdio/netbird/management/server/status"
+	"github.com/netbirdio/netbird/shared/management/status"
 )
 
 const (
@@ -33,7 +50,7 @@ func TestGetDNSSettings(t *testing.T) {
 
 	account, err := initTestDNSAccount(t, am)
 	if err != nil {
-		t.Fatal("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	dnsSettings, err := am.GetDNSSettings(context.Background(), account.Id, dnsAdminUserID)
@@ -45,7 +62,7 @@ func TestGetDNSSettings(t *testing.T) {
 		t.Fatal("DNS settings for new accounts shouldn't return nil")
 	}
 
-	account.DNSSettings = DNSSettings{
+	account.DNSSettings = types.DNSSettings{
 		DisabledManagementGroups: []string{group1ID},
 	}
 
@@ -78,20 +95,20 @@ func TestSaveDNSSettings(t *testing.T) {
 	testCases := []struct {
 		name          string
 		userID        string
-		inputSettings *DNSSettings
+		inputSettings *types.DNSSettings
 		shouldFail    bool
 	}{
 		{
 			name:   "Saving As Admin Should Be OK",
 			userID: dnsAdminUserID,
-			inputSettings: &DNSSettings{
+			inputSettings: &types.DNSSettings{
 				DisabledManagementGroups: []string{dnsGroup1ID},
 			},
 		},
 		{
 			name:   "Should Not Update Settings As Regular User",
 			userID: dnsRegularUserID,
-			inputSettings: &DNSSettings{
+			inputSettings: &types.DNSSettings{
 				DisabledManagementGroups: []string{dnsGroup1ID},
 			},
 			shouldFail: true,
@@ -105,7 +122,7 @@ func TestSaveDNSSettings(t *testing.T) {
 		{
 			name:   "Should Not Update Settings If Group Is Invalid",
 			userID: dnsAdminUserID,
-			inputSettings: &DNSSettings{
+			inputSettings: &types.DNSSettings{
 				DisabledManagementGroups: []string{"non-existing-group"},
 			},
 			shouldFail: true,
@@ -115,12 +132,12 @@ func TestSaveDNSSettings(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			am, err := createDNSManager(t)
 			if err != nil {
-				t.Error("failed to create account manager")
+				t.Fatalf("failed to create account manager")
 			}
 
 			account, err := initTestDNSAccount(t, am)
 			if err != nil {
-				t.Error("failed to init testing account")
+				t.Fatalf("failed to init testing account: %v", err)
 			}
 
 			err = am.SaveDNSSettings(context.Background(), account.Id, testCase.userID, testCase.inputSettings)
@@ -147,22 +164,22 @@ func TestGetNetworkMap_DNSConfigSync(t *testing.T) {
 
 	am, err := createDNSManager(t)
 	if err != nil {
-		t.Error("failed to create account manager")
+		t.Fatalf("failed to create account manager: %s", err)
 	}
 
 	account, err := initTestDNSAccount(t, am)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	peer1, err := account.FindPeerByPubKey(dnsPeer1Key)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	peer2, err := account.FindPeerByPubKey(dnsPeer2Key)
 	if err != nil {
-		t.Error("failed to init testing account")
+		t.Fatalf("failed to init testing account: %s", err)
 	}
 
 	newAccountDNSConfig, err := am.GetNetworkMap(context.Background(), peer1.ID)
@@ -195,13 +212,37 @@ func createDNSManager(t *testing.T) (*DefaultAccountManager, error) {
 		return nil, err
 	}
 	eventStore := &activity.InMemoryEventStore{}
-	return BuildManager(context.Background(), store, NewPeersUpdateManager(nil), nil, "", "netbird.test", eventStore, nil, false, MocIntegratedValidator{})
+
+	metrics, err := telemetry.NewDefaultAppMetrics(context.Background())
+	require.NoError(t, err)
+
+	ctrl := gomock.NewController(t)
+	t.Cleanup(ctrl.Finish)
+
+	settingsMockManager := settings.NewMockManager(ctrl)
+	// return empty extra settings for expected calls to UpdateAccountPeers
+	settingsMockManager.EXPECT().GetExtraSettings(gomock.Any(), gomock.Any()).Return(&types.ExtraSettings{}, nil).AnyTimes()
+	permissionsManager := permissions.NewManager(store)
+	peersManager := peers.NewManager(store, permissionsManager)
+
+	ctx := context.Background()
+
+	cacheStore, err := cache.NewStore(ctx, 100*time.Millisecond, 300*time.Millisecond, 100)
+	if err != nil {
+		return nil, err
+	}
+
+	updateManager := update_channel.NewPeersUpdateManager(metrics)
+	requestBuffer := NewAccountRequestBuffer(ctx, store)
+	networkMapController := controller.NewController(ctx, store, metrics, updateManager, requestBuffer, MockIntegratedValidator{}, settingsMockManager, "netbird.test", port_forwarding.NewControllerMock(), ephemeral_manager.NewEphemeralManager(store, peers.NewManager(store, permissionsManager)), &config.Config{}, nil)
+
+	return BuildManager(context.Background(), nil, store, networkMapController, job.NewJobManager(nil, store, peersManager), nil, "", eventStore, nil, false, MockIntegratedValidator{}, metrics, port_forwarding.NewControllerMock(), settingsMockManager, permissionsManager, false, cacheStore)
 }
 
-func createDNSStore(t *testing.T) (Store, error) {
+func createDNSStore(t *testing.T) (store.Store, error) {
 	t.Helper()
 	dataDir := t.TempDir()
-	store, cleanUp, err := NewTestStoreFromJson(context.Background(), dataDir)
+	store, cleanUp, err := store.NewTestStoreFromSQL(context.Background(), "", dataDir)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +251,7 @@ func createDNSStore(t *testing.T) (Store, error) {
 	return store, nil
 }
 
-func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, error) {
+func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*types.Account, error) {
 	t.Helper()
 	peer1 := &nbpeer.Peer{
 		Key:  dnsPeer1Key,
@@ -245,11 +286,11 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, erro
 
 	domain := "example.com"
 
-	account := newAccountWithId(context.Background(), dnsAccountID, dnsAdminUserID, domain)
+	account := newAccountWithId(context.Background(), dnsAccountID, dnsAdminUserID, domain, "", "", false)
 
-	account.Users[dnsRegularUserID] = &User{
+	account.Users[dnsRegularUserID] = &types.User{
 		Id:   dnsRegularUserID,
-		Role: UserRoleUser,
+		Role: types.UserRoleUser,
 	}
 
 	err := am.Store.SaveAccount(context.Background(), account)
@@ -257,11 +298,11 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, erro
 		return nil, err
 	}
 
-	savedPeer1, _, _, err := am.AddPeer(context.Background(), "", dnsAdminUserID, peer1)
+	savedPeer1, _, _, _, err := am.AddPeer(context.Background(), "", "", dnsAdminUserID, peer1, false)
 	if err != nil {
 		return nil, err
 	}
-	_, _, _, err = am.AddPeer(context.Background(), "", dnsAdminUserID, peer2)
+	_, _, _, _, err = am.AddPeer(context.Background(), "", "", dnsAdminUserID, peer2, false)
 	if err != nil {
 		return nil, err
 	}
@@ -281,13 +322,13 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, erro
 		return nil, err
 	}
 
-	newGroup1 := &group.Group{
+	newGroup1 := &types.Group{
 		ID:    dnsGroup1ID,
 		Peers: []string{peer1.ID},
 		Name:  dnsGroup1ID,
 	}
 
-	newGroup2 := &group.Group{
+	newGroup2 := &types.Group{
 		ID:   dnsGroup2ID,
 		Name: dnsGroup2ID,
 	}
@@ -300,13 +341,13 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, erro
 		return nil, err
 	}
 
-	account.NameServerGroups[dnsNSGroup1] = &dns.NameServerGroup{
+	account.NameServerGroups[dnsNSGroup1] = &nbdns.NameServerGroup{
 		ID:   dnsNSGroup1,
 		Name: "ns-group-1",
-		NameServers: []dns.NameServer{{
+		NameServers: []nbdns.NameServer{{
 			IP:     netip.MustParseAddr(savedPeer1.IP.String()),
-			NSType: dns.UDPNameServerType,
-			Port:   dns.DefaultDNSPort,
+			NSType: nbdns.UDPNameServerType,
+			Port:   nbdns.DefaultDNSPort,
 		}},
 		Primary: true,
 		Enabled: true,
@@ -319,4 +360,166 @@ func initTestDNSAccount(t *testing.T, am *DefaultAccountManager) (*Account, erro
 	}
 
 	return am.Store.GetAccount(context.Background(), account.Id)
+}
+
+func TestDNSAccountPeersUpdate(t *testing.T) {
+	manager, updateManager, account, peer1, peer2, peer3 := setupNetworkMapTest(t)
+
+	err := manager.CreateGroups(context.Background(), account.Id, userID, []*types.Group{
+		{
+			ID:    "groupA",
+			Name:  "GroupA",
+			Peers: []string{},
+		},
+		{
+			ID:    "groupB",
+			Name:  "GroupB",
+			Peers: []string{},
+		},
+	})
+	assert.NoError(t, err)
+
+	updMsg := updateManager.CreateChannel(context.Background(), peer1.ID)
+	t.Cleanup(func() {
+		updateManager.CloseChannel(context.Background(), peer1.ID)
+	})
+
+	// Saving DNS settings with groups that have no peers should not trigger updates to account peers or send peer updates
+	t.Run("saving dns setting with unused groups", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldNotReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err := manager.SaveDNSSettings(context.Background(), account.Id, userID, &types.DNSSettings{
+			DisabledManagementGroups: []string{"groupA"},
+		})
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// Creating DNS settings with groups that have no peers should not update account peers or send peer update
+	t.Run("creating dns setting with unused groups", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldNotReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		_, err = manager.CreateNameServerGroup(
+			context.Background(), account.Id, "ns-group", "ns-group", []nbdns.NameServer{{
+				IP:     netip.MustParseAddr(peer1.IP.String()),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			}},
+			[]string{"groupB"},
+			true, []string{}, true, userID, false,
+		)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// Creating DNS settings with groups that have peers should update account peers and send peer update
+	t.Run("creating dns setting with used groups", func(t *testing.T) {
+		err = manager.UpdateGroup(context.Background(), account.Id, userID, &types.Group{
+			ID:    "groupA",
+			Name:  "GroupA",
+			Peers: []string{peer1.ID, peer2.ID, peer3.ID},
+		})
+		assert.NoError(t, err)
+
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		_, err = manager.CreateNameServerGroup(
+			context.Background(), account.Id, "ns-group-1", "ns-group-1", []nbdns.NameServer{{
+				IP:     netip.MustParseAddr(peer1.IP.String()),
+				NSType: nbdns.UDPNameServerType,
+				Port:   nbdns.DefaultDNSPort,
+			}},
+			[]string{"groupA"},
+			true, []string{}, true, userID, false,
+		)
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(peerUpdateTimeout):
+			t.Error("timeout waiting for peerShouldReceiveUpdate")
+		}
+	})
+
+	// Saving DNS settings with groups that have peers should update account peers and send peer update
+	t.Run("saving dns setting with used groups", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err := manager.SaveDNSSettings(context.Background(), account.Id, userID, &types.DNSSettings{
+			DisabledManagementGroups: []string{"groupA", "groupB"},
+		})
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(peerUpdateTimeout):
+			t.Error("timeout waiting for peerShouldReceiveUpdate")
+		}
+	})
+
+	// Removing group with no peers from DNS settings  should not trigger updates to account peers or send peer updates
+	t.Run("removing group with no peers from dns settings", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldNotReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err := manager.SaveDNSSettings(context.Background(), account.Id, userID, &types.DNSSettings{
+			DisabledManagementGroups: []string{"groupA"},
+		})
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("timeout waiting for peerShouldNotReceiveUpdate")
+		}
+	})
+
+	// Removing group with peers from DNS settings should trigger updates to account peers and send peer updates
+	t.Run("removing group with peers from dns settings", func(t *testing.T) {
+		done := make(chan struct{})
+		go func() {
+			peerShouldReceiveUpdate(t, updMsg)
+			close(done)
+		}()
+
+		err := manager.SaveDNSSettings(context.Background(), account.Id, userID, &types.DNSSettings{
+			DisabledManagementGroups: []string{},
+		})
+		assert.NoError(t, err)
+
+		select {
+		case <-done:
+		case <-time.After(peerUpdateTimeout):
+			t.Error("timeout waiting for peerShouldReceiveUpdate")
+		}
+	})
 }

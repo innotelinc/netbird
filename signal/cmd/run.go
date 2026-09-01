@@ -6,24 +6,27 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"io/fs"
 	"net"
 	"net/http"
+	// nolint:gosec
+	_ "net/http/pprof"
 	"os"
-	"path"
-	"strings"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 
-	"github.com/netbirdio/netbird/signal/metrics"
+	"github.com/netbirdio/netbird/shared/metrics"
 
 	"github.com/netbirdio/netbird/encryption"
-	"github.com/netbirdio/netbird/signal/proto"
+	"github.com/netbirdio/netbird/shared/signal/proto"
 	"github.com/netbirdio/netbird/signal/server"
 	"github.com/netbirdio/netbird/util"
+	"github.com/netbirdio/netbird/util/wsproxy"
+	wsproxyserver "github.com/netbirdio/netbird/util/wsproxy/server"
 	"github.com/netbirdio/netbird/version"
 
 	log "github.com/sirupsen/logrus"
@@ -33,17 +36,16 @@ import (
 	"google.golang.org/grpc/keepalive"
 )
 
-const (
-	metricsPort = 9090
-)
+const legacyGRPCPort = 10000
 
 var (
-	signalPort              int
-	signalLetsencryptDomain string
-	signalSSLDir            string
-	defaultSignalSSLDir     string
-	signalCertFile          string
-	signalCertKey           string
+	signalPort               int
+	metricsPort              int
+	signalLetsencryptDomain  string
+	signalLetsencryptEmail   string
+	signalLetsencryptDataDir string
+	signalCertFile           string
+	signalCertKey            string
 
 	signalKaep = grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
 		MinTime:             5 * time.Second,
@@ -58,15 +60,21 @@ var (
 	})
 
 	runCmd = &cobra.Command{
-		Use:   "run",
-		Short: "start NetBird Signal Server daemon",
-		PreRun: func(cmd *cobra.Command, args []string) {
+		Use:          "run",
+		Short:        "start NetBird Signal Server daemon",
+		SilenceUsage: true,
+		PreRunE: func(cmd *cobra.Command, args []string) error {
+			err := util.InitLog(logLevel, logFile)
+			if err != nil {
+				return fmt.Errorf("failed initializing log: %w", err)
+			}
+
 			flag.Parse()
 
 			// detect whether user specified a port
 			userPort := cmd.Flag("port").Changed
 
-			tlsEnabled := false
+			var tlsEnabled bool
 			if signalLetsencryptDomain != "" || (signalCertFile != "" && signalCertKey != "") {
 				tlsEnabled = true
 			}
@@ -79,47 +87,20 @@ var (
 					signalPort = 80
 				}
 			}
+
+			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			flag.Parse()
 
-			err := util.InitLog(logLevel, logFile)
+			startPprof()
+
+			opts, certManager, tlsConfig, err := getTLSConfigurations()
 			if err != nil {
-				log.Fatalf("failed initializing log %v", err)
+				return err
 			}
 
-			if signalSSLDir == "" {
-				oldPath := "/var/lib/wiretrustee"
-				if migrateToNetbird(oldPath, defaultSignalSSLDir) {
-					if err := cpDir(oldPath, defaultSignalSSLDir); err != nil {
-						log.Fatal(err)
-					}
-				}
-			}
-
-			var opts []grpc.ServerOption
-			var certManager *autocert.Manager
-			var tlsConfig *tls.Config
-			if signalLetsencryptDomain != "" {
-				certManager, err = encryption.CreateCertManager(signalSSLDir, signalLetsencryptDomain)
-				if err != nil {
-					return err
-				}
-				transportCredentials := credentials.NewTLS(certManager.TLSConfig())
-				opts = append(opts, grpc.Creds(transportCredentials))
-				log.Infof("setting up TLS with LetsEncrypt.")
-			} else if signalCertFile != "" && signalCertKey != "" {
-				tlsConfig, err = loadTLSConfig(signalCertFile, signalCertKey)
-				if err != nil {
-					log.Errorf("cannot load TLS credentials: %v", err)
-					return err
-				}
-				transportCredentials := credentials.NewTLS(tlsConfig)
-				opts = append(opts, grpc.Creds(transportCredentials))
-				log.Infof("setting up TLS with custom certificates.")
-			}
-
-			metricsServer := metrics.NewServer(metricsPort, "")
+			metricsServer, err := metrics.NewServer(metricsPort, "")
 			if err != nil {
 				return fmt.Errorf("setup metrics: %v", err)
 			}
@@ -134,44 +115,47 @@ var (
 				}
 			}()
 
-			srv, err := server.NewServer(metricsServer.Meter)
+			srv, err := server.NewServer(cmd.Context(), metricsServer.Meter)
 			if err != nil {
 				return fmt.Errorf("creating signal server: %v", err)
 			}
 			proto.RegisterSignalExchangeServer(grpcServer, srv)
 
-			grpcRootHandler := grpcHandlerFunc(grpcServer)
+			grpcRootHandler := grpcHandlerFunc(grpcServer, metricsServer.Meter)
+
+			if certManager != nil {
+				startServerWithCertManager(certManager, grpcRootHandler)
+			}
+
 			var compatListener net.Listener
 			var grpcListener net.Listener
 			var httpListener net.Listener
 
-			if certManager != nil {
-				// a call to certManager.Listener() always creates a new listener so we do it once
-				httpListener := certManager.Listener()
-				if signalPort == 443 {
-					// running gRPC and HTTP cert manager on the same port
-					serveHTTP(httpListener, certManager.HTTPHandler(grpcRootHandler))
-					log.Infof("running HTTP server (LetsEncrypt challenge handler) and gRPC server on the same port: %s", httpListener.Addr().String())
-				} else {
-					// Start the HTTP cert manager server separately
-					serveHTTP(httpListener, certManager.HTTPHandler(nil))
-					log.Infof("running HTTP server (LetsEncrypt challenge handler): %s", httpListener.Addr().String())
-				}
-			}
-
-			// If certManager is configured and signalPort == 443, then the gRPC server has already been started
-			if certManager == nil || signalPort != 443 {
-				grpcListener, err = serveGRPC(grpcServer, signalPort)
+			// Start the main server - always serve HTTP with WebSocket proxy support
+			// If certManager is configured and signalPort == 443, it's already handled by startServerWithCertManager
+			if tlsConfig == nil {
+				// Without TLS, serve plain HTTP
+				httpListener, err = net.Listen("tcp", fmt.Sprintf(":%d", signalPort))
 				if err != nil {
 					return err
 				}
-				log.Infof("running gRPC server: %s", grpcListener.Addr().String())
+				log.Infof("running HTTP server with WebSocket proxy (no TLS): %s", httpListener.Addr().String())
+				serveHTTP(httpListener, grpcRootHandler)
+			} else if certManager == nil || signalPort != 443 {
+				// Serve HTTPS if not already handled by startServerWithCertManager
+				// (custom certificates or Let's Encrypt with custom port)
+				httpListener, err = tls.Listen("tcp", fmt.Sprintf(":%d", signalPort), tlsConfig)
+				if err != nil {
+					return err
+				}
+				log.Infof("running HTTPS server with WebSocket proxy: %s", httpListener.Addr().String())
+				serveHTTP(httpListener, grpcRootHandler)
 			}
 
-			if signalPort != 10000 {
+			if signalPort != legacyGRPCPort {
 				// The Signal gRPC server was running on port 10000 previously. Old agents that are already connected to Signal
 				// are using port 10000. For compatibility purposes we keep running a 2nd gRPC server on port 10000.
-				compatListener, err = serveGRPC(grpcServer, 10000)
+				compatListener, err = serveGRPC(grpcServer, legacyGRPCPort)
 				if err != nil {
 					return err
 				}
@@ -211,11 +195,77 @@ var (
 	}
 )
 
-func grpcHandlerFunc(grpcServer *grpc.Server) http.Handler {
+func startPprof() {
+	if pprofAddr := os.Getenv("NB_PPROF_ADDR"); pprofAddr != "" {
+		log.Infof("pprof enabled, listening on: %s", pprofAddr)
+		go func() {
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				log.Fatalf("pprof server failed: %v", err)
+			}
+		}()
+	}
+}
+
+func getTLSConfigurations() ([]grpc.ServerOption, *autocert.Manager, *tls.Config, error) {
+	var (
+		err         error
+		certManager *autocert.Manager
+		tlsConfig   *tls.Config
+	)
+
+	if signalLetsencryptDomain == "" && signalCertFile == "" && signalCertKey == "" {
+		log.Infof("running without TLS")
+		return nil, nil, nil, nil
+	}
+
+	if signalLetsencryptDomain != "" {
+		certManager, err = encryption.CreateCertManager(signalLetsencryptDataDir, signalLetsencryptDomain)
+		if err != nil {
+			return nil, certManager, nil, err
+		}
+		tlsConfig = certManager.TLSConfig()
+		log.Infof("setting up TLS with LetsEncrypt.")
+	} else {
+		if signalCertFile == "" || signalCertKey == "" {
+			log.Errorf("both cert-file and cert-key must be provided when not using LetsEncrypt")
+			return nil, certManager, nil, errors.New("both cert-file and cert-key must be provided when not using LetsEncrypt")
+		}
+
+		tlsConfig, err = loadTLSConfig(signalCertFile, signalCertKey)
+		if err != nil {
+			log.Errorf("cannot load TLS credentials: %v", err)
+			return nil, certManager, nil, err
+		}
+		log.Infof("setting up TLS with custom certificates.")
+	}
+
+	transportCredentials := credentials.NewTLS(tlsConfig)
+
+	return []grpc.ServerOption{grpc.Creds(transportCredentials)}, certManager, tlsConfig, err
+}
+
+func startServerWithCertManager(certManager *autocert.Manager, grpcRootHandler http.Handler) {
+	// a call to certManager.Listener() always creates a new listener so we do it once
+	httpListener := certManager.Listener()
+	if signalPort == 443 {
+		// running gRPC and HTTP cert manager on the same port
+		serveHTTP(httpListener, certManager.HTTPHandler(grpcRootHandler))
+		log.Infof("running HTTP server (LetsEncrypt challenge handler) and gRPC server on the same port: %s", httpListener.Addr().String())
+	} else {
+		// Start the HTTP cert manager server separately
+		serveHTTP(httpListener, certManager.HTTPHandler(nil))
+		log.Infof("running HTTP server (LetsEncrypt challenge handler): %s", httpListener.Addr().String())
+	}
+}
+
+func grpcHandlerFunc(grpcServer *grpc.Server, meter metric.Meter) http.Handler {
+	wsProxy := wsproxyserver.New(grpcServer, wsproxyserver.WithOTelMeter(meter))
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		grpcHeader := strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc") ||
-			strings.HasPrefix(r.Header.Get("Content-Type"), "application/grpc+proto")
-		if r.ProtoMajor == 2 && grpcHeader {
+		switch r.URL.Path {
+		case wsproxy.ProxyPath + wsproxy.SignalComponent:
+			wsProxy.Handler().ServeHTTP(w, r)
+		default:
 			grpcServer.ServeHTTP(w, r)
 		}
 	})
@@ -232,7 +282,12 @@ func notifyStop(msg string) {
 
 func serveHTTP(httpListener net.Listener, handler http.Handler) {
 	go func() {
-		err := http.Serve(httpListener, handler)
+		// Use h2c to support HTTP/2 without TLS (needed for gRPC)
+		h1s := &http.Server{
+			//nolint:staticcheck // h2c also handles the HTTP/1 Upgrade mechanism, which http.Server's UnencryptedHTTP2 does not
+			Handler: h2c.NewHandler(handler, &http2.Server{}),
+		}
+		err := h1s.Serve(httpListener)
 		if err != nil {
 			notifyStop(fmt.Sprintf("failed running HTTP server %v", err))
 		}
@@ -272,97 +327,14 @@ func loadTLSConfig(certFile string, certKey string) (*tls.Config, error) {
 	return config, nil
 }
 
-func cpFile(src, dst string) error {
-	var err error
-	var srcfd *os.File
-	var dstfd *os.File
-	var srcinfo os.FileInfo
-
-	if srcfd, err = os.Open(src); err != nil {
-		return err
-	}
-	defer srcfd.Close()
-
-	if dstfd, err = os.Create(dst); err != nil {
-		return err
-	}
-	defer dstfd.Close()
-
-	if _, err = io.Copy(dstfd, srcfd); err != nil {
-		return err
-	}
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-	return os.Chmod(dst, srcinfo.Mode())
-}
-
-func copySymLink(source, dest string) error {
-	link, err := os.Readlink(source)
-	if err != nil {
-		return err
-	}
-	return os.Symlink(link, dest)
-}
-
-func cpDir(src string, dst string) error {
-	var err error
-	var fds []os.DirEntry
-	var srcinfo os.FileInfo
-
-	if srcinfo, err = os.Stat(src); err != nil {
-		return err
-	}
-
-	if err = os.MkdirAll(dst, srcinfo.Mode()); err != nil {
-		return err
-	}
-
-	if fds, err = os.ReadDir(src); err != nil {
-		return err
-	}
-	for _, fd := range fds {
-		srcfp := path.Join(src, fd.Name())
-		dstfp := path.Join(dst, fd.Name())
-
-		fileInfo, err := os.Stat(srcfp)
-		if err != nil {
-			log.Fatalf("Couldn't get fileInfo; %v", err)
-		}
-
-		switch fileInfo.Mode() & os.ModeType {
-		case os.ModeSymlink:
-			if err = copySymLink(srcfp, dstfp); err != nil {
-				log.Fatalf("Failed to copy from %s to %s; %v", srcfp, dstfp, err)
-			}
-		case os.ModeDir:
-			if err = cpDir(srcfp, dstfp); err != nil {
-				log.Fatalf("Failed to copy from %s to %s; %v", srcfp, dstfp, err)
-			}
-		default:
-			if err = cpFile(srcfp, dstfp); err != nil {
-				log.Fatalf("Failed to copy from %s to %s; %v", srcfp, dstfp, err)
-			}
-		}
-	}
-	return nil
-}
-
-func migrateToNetbird(oldPath, newPath string) bool {
-	_, errOld := os.Stat(oldPath)
-	_, errNew := os.Stat(newPath)
-
-	if errors.Is(errOld, fs.ErrNotExist) || errNew == nil {
-		return false
-	}
-
-	return true
-}
-
 func init() {
 	runCmd.PersistentFlags().IntVar(&signalPort, "port", 80, "Server port to listen on (defaults to 443 if TLS is enabled, 80 otherwise")
-	runCmd.Flags().StringVar(&signalSSLDir, "ssl-dir", defaultSignalSSLDir, "server ssl directory location. *Required only for Let's Encrypt certificates.")
-	runCmd.Flags().StringVar(&signalLetsencryptDomain, "letsencrypt-domain", "", "a domain to issue Let's Encrypt certificate for. Enables TLS using Let's Encrypt. Will fetch and renew certificate, and run the server with TLS")
-	runCmd.Flags().StringVar(&signalCertFile, "cert-file", "", "Location of your SSL certificate. Can be used when you have an existing certificate and don't want a new certificate be generated automatically. If letsencrypt-domain is specified this property has no effect")
-	runCmd.Flags().StringVar(&signalCertKey, "cert-key", "", "Location of your SSL certificate private key. Can be used when you have an existing certificate and don't want a new certificate be generated automatically. If letsencrypt-domain is specified this property has no effect")
+	runCmd.Flags().IntVar(&metricsPort, "metrics-port", 9090, "metrics endpoint http port. Metrics are accessible under host:metrics-port/metrics")
+	runCmd.PersistentFlags().StringVar(&signalLetsencryptDataDir, "letsencrypt-data-dir", "", "a directory to store Let's Encrypt data. Required if Let's Encrypt is enabled.")
+	runCmd.PersistentFlags().StringVar(&signalLetsencryptDataDir, "ssl-dir", "", "server ssl directory location. *Required only for Let's Encrypt certificates. Deprecated: use --letsencrypt-data-dir")
+	runCmd.PersistentFlags().StringVar(&signalLetsencryptDomain, "letsencrypt-domain", "", "a domain to issue Let's Encrypt certificate for. Enables TLS using Let's Encrypt. Will fetch and renew certificate, and run the server with TLS")
+	runCmd.PersistentFlags().StringVar(&signalLetsencryptEmail, "letsencrypt-email", "", "email address to use for Let's Encrypt certificate registration")
+	runCmd.PersistentFlags().StringVar(&signalCertFile, "cert-file", "", "Location of your SSL certificate. Can be used when you have an existing certificate and don't want a new certificate be generated automatically. If letsencrypt-domain is specified this property has no effect")
+	runCmd.PersistentFlags().StringVar(&signalCertKey, "cert-key", "", "Location of your SSL certificate private key. Can be used when you have an existing certificate and don't want a new certificate be generated automatically. If letsencrypt-domain is specified this property has no effect")
+	setFlagsFromEnvVars(runCmd)
 }

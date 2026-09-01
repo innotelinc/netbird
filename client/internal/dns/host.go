@@ -5,20 +5,33 @@ import (
 	"net/netip"
 	"strings"
 
+	"github.com/miekg/dns"
+
+	"github.com/netbirdio/netbird/client/internal/statemanager"
 	nbdns "github.com/netbirdio/netbird/dns"
 )
 
 type hostManager interface {
-	applyDNSConfig(config HostDNSConfig) error
+	applyDNSConfig(config HostDNSConfig, stateManager *statemanager.Manager) error
 	restoreHostDNS() error
 	supportCustomPort() bool
-	restoreUncleanShutdownDNS(storedDNSAddress *netip.Addr) error
+	string() string
+	// getOriginalNameservers returns the OS-side resolvers used as PriorityFallback
+	// upstreams: pre-takeover snapshots on desktop, the OS-pushed list on Android,
+	// hardcoded Quad9 on iOS, nil for noop / mock.
+	getOriginalNameservers() []netip.Addr
+}
+
+type SystemDNSSettings struct {
+	Domains    []string
+	ServerIP   netip.Addr
+	ServerPort int
 }
 
 type HostDNSConfig struct {
 	Domains    []DomainConfig `json:"domains"`
 	RouteAll   bool           `json:"routeAll"`
-	ServerIP   string         `json:"serverIP"`
+	ServerIP   netip.Addr     `json:"serverIP"`
 	ServerPort int            `json:"serverPort"`
 }
 
@@ -29,15 +42,16 @@ type DomainConfig struct {
 }
 
 type mockHostConfigurator struct {
-	applyDNSConfigFunc            func(config HostDNSConfig) error
+	applyDNSConfigFunc            func(config HostDNSConfig, stateManager *statemanager.Manager) error
 	restoreHostDNSFunc            func() error
 	supportCustomPortFunc         func() bool
 	restoreUncleanShutdownDNSFunc func(*netip.Addr) error
+	stringFunc                    func() string
 }
 
-func (m *mockHostConfigurator) applyDNSConfig(config HostDNSConfig) error {
+func (m *mockHostConfigurator) applyDNSConfig(config HostDNSConfig, stateManager *statemanager.Manager) error {
 	if m.applyDNSConfigFunc != nil {
-		return m.applyDNSConfigFunc(config)
+		return m.applyDNSConfigFunc(config, stateManager)
 	}
 	return fmt.Errorf("method applyDNSSettings is not implemented")
 }
@@ -56,23 +70,23 @@ func (m *mockHostConfigurator) supportCustomPort() bool {
 	return false
 }
 
-func (m *mockHostConfigurator) restoreUncleanShutdownDNS(storedDNSAddress *netip.Addr) error {
-	if m.restoreUncleanShutdownDNSFunc != nil {
-		return m.restoreUncleanShutdownDNSFunc(storedDNSAddress)
+func (m *mockHostConfigurator) string() string {
+	if m.stringFunc != nil {
+		return m.stringFunc()
 	}
-	return fmt.Errorf("method restoreUncleanShutdownDNS is not implemented")
+	return "mock"
 }
 
 func newNoopHostMocker() hostManager {
 	return &mockHostConfigurator{
-		applyDNSConfigFunc:            func(config HostDNSConfig) error { return nil },
+		applyDNSConfigFunc:            func(config HostDNSConfig, stateManager *statemanager.Manager) error { return nil },
 		restoreHostDNSFunc:            func() error { return nil },
 		supportCustomPortFunc:         func() bool { return true },
 		restoreUncleanShutdownDNSFunc: func(*netip.Addr) error { return nil },
 	}
 }
 
-func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip string, port int) HostDNSConfig {
+func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip netip.Addr, port int) HostDNSConfig {
 	config := HostDNSConfig{
 		RouteAll:   false,
 		ServerIP:   ip,
@@ -88,7 +102,7 @@ func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip string, port int) HostD
 
 		for _, domain := range nsConfig.Domains {
 			config.Domains = append(config.Domains, DomainConfig{
-				Domain:    strings.TrimSuffix(domain, "."),
+				Domain:    strings.ToLower(dns.Fqdn(domain)),
 				MatchOnly: !nsConfig.SearchDomainsEnabled,
 			})
 		}
@@ -96,10 +110,36 @@ func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip string, port int) HostD
 
 	for _, customZone := range dnsConfig.CustomZones {
 		config.Domains = append(config.Domains, DomainConfig{
-			Domain:    strings.TrimSuffix(customZone.Domain, "."),
-			MatchOnly: false,
+			Domain:    strings.ToLower(dns.Fqdn(customZone.Domain)),
+			MatchOnly: customZone.SearchDomainDisabled,
 		})
 	}
 
 	return config
+}
+
+type noopHostConfigurator struct{}
+
+func (n noopHostConfigurator) applyDNSConfig(HostDNSConfig, *statemanager.Manager) error {
+	return nil
+}
+
+func (n noopHostConfigurator) restoreHostDNS() error {
+	return nil
+}
+
+func (n noopHostConfigurator) supportCustomPort() bool {
+	return true
+}
+
+func (n noopHostConfigurator) string() string {
+	return "noop"
+}
+
+func (n noopHostConfigurator) getOriginalNameservers() []netip.Addr {
+	return nil
+}
+
+func (m *mockHostConfigurator) getOriginalNameservers() []netip.Addr {
+	return nil
 }

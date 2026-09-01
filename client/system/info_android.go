@@ -1,6 +1,3 @@
-//go:build android
-// +build android
-
 package system
 
 import (
@@ -15,6 +12,11 @@ import (
 	"github.com/netbirdio/netbird/version"
 )
 
+// UpdateStaticInfoAsync is a no-op on Android as there is no static info to update
+func UpdateStaticInfoAsync() {
+	// do nothing
+}
+
 // GetInfo retrieves and parses the system information
 func GetInfo(ctx context.Context) *Info {
 	kernel := "android"
@@ -28,6 +30,11 @@ func GetInfo(ctx context.Context) *Info {
 		kernelVersion = osInfo[2]
 	}
 
+	addrs, err := networkAddresses()
+	if err != nil {
+		log.Warnf("discover network addresses: %s", err)
+	}
+
 	gio := &Info{
 		GoOS:               runtime.GOOS,
 		Kernel:             kernel,
@@ -36,17 +43,50 @@ func GetInfo(ctx context.Context) *Info {
 		OSVersion:          osVersion(),
 		Hostname:           extractDeviceName(ctx, "android"),
 		CPUs:               runtime.NumCPU(),
-		WiretrusteeVersion: version.NetbirdVersion(),
+		NetbirdVersion:     version.NetbirdVersion(),
 		UIVersion:          extractUIVersion(ctx),
 		KernelVersion:      kernelVersion,
+		NetworkAddresses:   addrs,
+		SystemSerialNumber: serial(),
+		SystemProductName:  productModel(),
+		SystemManufacturer: productManufacturer(),
 	}
 
 	return gio
 }
 
 // checkFileAndProcess checks if the file path exists and if a process is running at that path.
-func checkFileAndProcess(paths []string) ([]File, error) {
+func checkFileAndProcess(_ context.Context, _ []string) ([]File, error) {
 	return []File{}, nil
+}
+
+func serial() string {
+	// try to fetch serial ID using different properties
+	properties := []string{"ril.serialnumber", "ro.serialno", "ro.boot.serialno", "sys.serialnumber"}
+	var value string
+
+	for _, property := range properties {
+		value = getprop(property)
+		if len(value) > 0 {
+			return value
+		}
+	}
+
+	// unable to get serial ID, fallback to ANDROID_ID
+	return androidId()
+}
+
+func androidId() string {
+	// this is a uniq id defined on first initialization, id will be a new one if user wipes his device
+	return run("/system/bin/settings", "get", "secure", "android_id")
+}
+
+func productModel() string {
+	return getprop("ro.product.model")
+}
+
+func productManufacturer() string {
+	return getprop("ro.product.manufacturer")
 }
 
 func uname() []string {
@@ -55,7 +95,7 @@ func uname() []string {
 }
 
 func osVersion() string {
-	return run("/system/bin/getprop", "ro.build.version.release")
+	return getprop("ro.build.version.release")
 }
 
 func extractUIVersion(ctx context.Context) string {
@@ -64,6 +104,10 @@ func extractUIVersion(ctx context.Context) string {
 		return ""
 	}
 	return v
+}
+
+func getprop(arg ...string) string {
+	return run("/system/bin/getprop", arg...)
 }
 
 func run(name string, arg ...string) string {

@@ -2,15 +2,17 @@ package idp
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/golang-jwt/jwt"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
@@ -32,6 +34,7 @@ type ZitadelClientConfig struct {
 	GrantType          string
 	TokenEndpoint      string
 	ManagementEndpoint string
+	PAT                string
 }
 
 // ZitadelCredentials zitadel authentication information.
@@ -97,35 +100,86 @@ type zitadelUserResponse struct {
 	PasswordlessRegistration zitadelPasswordlessRegistration `json:"passwordlessRegistration"`
 }
 
+// readZitadelError parses errors returned by the zitadel APIs from a response.
+func readZitadelError(body io.ReadCloser) error {
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	helper := JsonParser{}
+	var target map[string]interface{}
+	err = helper.Unmarshal(bodyBytes, &target)
+	if err != nil {
+		return fmt.Errorf("error unparsable body: %s", string(bodyBytes))
+	}
+
+	// ensure keys are ordered for consistent logging behaviour.
+	errorKeys := make([]string, 0, len(target))
+	for k := range target {
+		errorKeys = append(errorKeys, k)
+	}
+	slices.Sort(errorKeys)
+
+	var errsOut []string
+	for _, k := range errorKeys {
+		if _, isEmbedded := target[k].(map[string]interface{}); isEmbedded {
+			continue
+		}
+		errsOut = append(errsOut, fmt.Sprintf("%s: %v", k, target[k]))
+	}
+
+	if len(errsOut) == 0 {
+		return errors.New("unknown error")
+	}
+
+	return errors.New(strings.Join(errsOut, " "))
+}
+
+// verifyJWTConfig ensures necessary values are set in the ZitadelClientConfig for JWTs to be generated.
+func verifyJWTConfig(config ZitadelClientConfig) error {
+
+	if config.ClientID == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, clientID is missing")
+	}
+
+	if config.ClientSecret == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, ClientSecret is missing")
+	}
+
+	if config.TokenEndpoint == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, TokenEndpoint is missing")
+	}
+
+	if config.GrantType == "" {
+		return fmt.Errorf("zitadel IdP configuration is incomplete, GrantType is missing")
+	}
+
+	return nil
+}
+
 // NewZitadelManager creates a new instance of the ZitadelManager.
 func NewZitadelManager(config ZitadelClientConfig, appMetrics telemetry.AppMetrics) (*ZitadelManager, error) {
 	httpTransport := http.DefaultTransport.(*http.Transport).Clone()
 	httpTransport.MaxIdleConns = 5
 
 	httpClient := &http.Client{
-		Timeout:   10 * time.Second,
+		Timeout:   idpTimeout(),
 		Transport: httpTransport,
 	}
+
 	helper := JsonParser{}
 
-	if config.ClientID == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, clientID is missing")
-	}
-
-	if config.ClientSecret == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, ClientSecret is missing")
-	}
-
-	if config.TokenEndpoint == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, TokenEndpoint is missing")
+	hasPAT := config.PAT != ""
+	if !hasPAT {
+		jwtErr := verifyJWTConfig(config)
+		if jwtErr != nil {
+			return nil, jwtErr
+		}
 	}
 
 	if config.ManagementEndpoint == "" {
 		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, ManagementEndpoint is missing")
-	}
-
-	if config.GrantType == "" {
-		return nil, fmt.Errorf("zitadel IdP configuration is incomplete, GrantType is missing")
 	}
 
 	credentials := &ZitadelCredentials{
@@ -176,7 +230,8 @@ func (zc *ZitadelCredentials) requestJWTToken(ctx context.Context) (*http.Respon
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unable to get zitadel token, statusCode %d", resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+		return nil, fmt.Errorf("unable to get zitadel token, statusCode %d, zitadel: %w", resp.StatusCode, zErr)
 	}
 
 	return resp, nil
@@ -199,7 +254,7 @@ func (zc *ZitadelCredentials) parseRequestJWTResponse(rawBody io.ReadCloser) (JW
 		return jwtToken, fmt.Errorf("error while reading response body, expires_in: %d and access_token: %s", jwtToken.ExpiresIn, jwtToken.AccessToken)
 	}
 
-	data, err := jwt.DecodeSegment(strings.Split(jwtToken.AccessToken, ".")[1])
+	data, err := base64.RawURLEncoding.DecodeString(strings.Split(jwtToken.AccessToken, ".")[1])
 	if err != nil {
 		return jwtToken, err
 	}
@@ -215,6 +270,20 @@ func (zc *ZitadelCredentials) parseRequestJWTResponse(rawBody io.ReadCloser) (JW
 	return jwtToken, nil
 }
 
+// generatePATToken creates a functional JWTToken instance which will pass the
+// PAT to the API directly and skip requesting a token.
+func (zc *ZitadelCredentials) generatePATToken() (JWTToken, error) {
+	tok := JWTToken{
+		AccessToken: zc.clientConfig.PAT,
+		Scope:       "openid",
+		ExpiresIn:   9999,
+		TokenType:   "PAT",
+	}
+	tok.expiresInTime = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	zc.jwtToken = tok
+	return tok, nil
+}
+
 // Authenticate retrieves access token to use the Zitadel Management API.
 func (zc *ZitadelCredentials) Authenticate(ctx context.Context) (JWTToken, error) {
 	zc.mux.Lock()
@@ -228,6 +297,10 @@ func (zc *ZitadelCredentials) Authenticate(ctx context.Context) (JWTToken, error
 	// and if expiry time is sufficient time available to make a request.
 	if zc.jwtStillValid() {
 		return zc.jwtToken, nil
+	}
+
+	if zc.clientConfig.PAT != "" {
+		return zc.generatePATToken()
 	}
 
 	resp, err := zc.requestJWTToken(ctx)
@@ -285,7 +358,7 @@ func (zm *ZitadelManager) CreateUser(ctx context.Context, email, name, accountID
 		return nil, err
 	}
 
-	var pending bool = true
+	pending := true
 	ret := &UserData{
 		Email: email,
 		Name:  name,
@@ -489,7 +562,9 @@ func (zm *ZitadelManager) post(ctx context.Context, resource string, body string
 			zm.appMetrics.IDPMetrics().CountRequestStatusError()
 		}
 
-		return nil, fmt.Errorf("unable to post %s, statusCode %d", reqURL, resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+
+		return nil, fmt.Errorf("unable to post %s, statusCode %d, zitadel: %w", reqURL, resp.StatusCode, zErr)
 	}
 
 	return io.ReadAll(resp.Body)
@@ -561,7 +636,9 @@ func (zm *ZitadelManager) get(ctx context.Context, resource string, q url.Values
 			zm.appMetrics.IDPMetrics().CountRequestStatusError()
 		}
 
-		return nil, fmt.Errorf("unable to get %s, statusCode %d", reqURL, resp.StatusCode)
+		zErr := readZitadelError(resp.Body)
+
+		return nil, fmt.Errorf("unable to get %s, statusCode %d, zitadel: %w", reqURL, resp.StatusCode, zErr)
 	}
 
 	return io.ReadAll(resp.Body)

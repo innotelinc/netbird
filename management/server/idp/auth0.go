@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/netbirdio/netbird/management/server/telemetry"
 
-	"github.com/golang-jwt/jwt"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -136,9 +136,10 @@ func NewAuth0Manager(config Auth0ClientConfig, appMetrics telemetry.AppMetrics) 
 	httpTransport.MaxIdleConns = 5
 
 	httpClient := &http.Client{
-		Timeout:   10 * time.Second,
+		Timeout:   idpTimeout(),
 		Transport: httpTransport,
 	}
+
 	helper := JsonParser{}
 
 	if config.AuthIssuer == "" {
@@ -231,7 +232,7 @@ func (c *Auth0Credentials) parseRequestJWTResponse(rawBody io.ReadCloser) (JWTTo
 	if jwtToken.ExpiresIn == 0 && jwtToken.AccessToken == "" {
 		return jwtToken, fmt.Errorf("error while reading response body, expires_in: %d and access_token: %s", jwtToken.ExpiresIn, jwtToken.AccessToken)
 	}
-	data, err := jwt.DecodeSegment(strings.Split(jwtToken.AccessToken, ".")[1])
+	data, err := base64.RawURLEncoding.DecodeString(strings.Split(jwtToken.AccessToken, ".")[1])
 	if err != nil {
 		return jwtToken, err
 	}
